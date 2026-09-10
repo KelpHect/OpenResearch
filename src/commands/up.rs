@@ -2635,7 +2635,14 @@ fn file_version_on_disk(path: &std::path::Path) -> std::result::Result<String, A
 fn validated_project_file_path(
     path: &str,
 ) -> std::result::Result<(String, std::path::PathBuf), ApiError> {
-    let rel = path.trim().trim_start_matches("./").to_string();
+    let mut rel = path.trim().trim_start_matches("./").to_string();
+    // File paths on the wire use `/` on every platform. Accept the native
+    // Windows spelling from agents, but keep the API response stable for the
+    // dashboard and persisted chat context.
+    #[cfg(windows)]
+    {
+        rel = rel.replace('\\', "/");
+    }
     if rel.is_empty() || rel.len() > 1024 {
         return Err(bad_request("invalid path"));
     }
@@ -2974,7 +2981,12 @@ fn manage_local_file(
         }
         FileAction::Delete => unreachable!(),
     }
-    Ok(destination_rel.to_string_lossy().into_owned())
+    let mut destination = destination_rel.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    {
+        destination = destination.replace('\\', "/");
+    }
+    Ok(destination)
 }
 
 async fn manage_project_file(
@@ -3784,9 +3796,15 @@ fn validated_absolute_file_path(
         return Err(bad_request("invalid path"));
     }
     let resolved = match trimmed.strip_prefix('~') {
-        Some(rest) if rest.is_empty() || rest.starts_with('/') => dirs::home_dir()
-            .ok_or_else(|| bad_request("no home directory"))?
-            .join(rest.trim_start_matches('/')),
+        Some(rest)
+            if rest.is_empty()
+                || rest.starts_with('/')
+                || (cfg!(windows) && rest.starts_with('\\')) =>
+        {
+            dirs::home_dir()
+                .ok_or_else(|| bad_request("no home directory"))?
+                .join(rest.trim_start_matches(['/', '\\']))
+        }
         _ => std::path::PathBuf::from(trimmed),
     };
     if !resolved.is_absolute() {
@@ -8246,12 +8264,17 @@ mod tests {
 
     #[test]
     fn absolute_file_paths_require_an_absolute_path() {
+        let absolute = if cfg!(windows) {
+            std::env::temp_dir()
+                .join("hosts")
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            "/etc/hosts".to_string()
+        };
         assert_eq!(
-            abs_path("  /etc/hosts  "),
-            Ok((
-                "/etc/hosts".to_string(),
-                std::path::PathBuf::from("/etc/hosts")
-            )),
+            abs_path(&format!("  {absolute}  ")),
+            Ok((absolute.clone(), std::path::PathBuf::from(&absolute))),
         );
         for path in ["", "   ", "relative/path", "../secret", &"/x".repeat(3000)] {
             assert!(abs_path(path).is_err(), "accepted {path:?}");

@@ -233,7 +233,7 @@ pub(super) enum BinProbe {
 
 /// `<bin> --version`, with a timeout (node CLIs can be slow).
 pub(super) async fn probe_bin(bin: &Path) -> BinProbe {
-    let mut cmd = tokio::process::Command::new(bin);
+    let mut cmd = crate::sys::tokio_command(bin);
     cmd.arg("--version").stdin(std::process::Stdio::null());
     // An unparseable version downgrades a signed-in harness to `Unknown` —
     // which is why a synced `FORCE_COLOR` must not reach the version line.

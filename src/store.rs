@@ -24,9 +24,9 @@ pub fn data_dir() -> PathBuf {
     //   2. persisted user choice (config_dir()/settings.json `dataDir`) — set
     //      from the UI's Storage settings. Read fresh every call (no cache) so a
     //      just-completed data-dir move is picked up by the next Store::open().
-    //   3. $XDG_DATA_HOME/openresearch — ambient system default *base*; an
-    //      explicit UI choice rightly beats it, so it sits below (2).
-    //   4. ~/.local/share/openresearch — hardcoded default.
+    //   3. the platform data directory (or $XDG_DATA_HOME/openresearch on
+    //      Unix) — ambient system default *base*; an explicit UI choice rightly
+    //      beats it, so it sits below (2).
     if let Some(dir) = env_path("ORX_DATA_DIR") {
         return dir;
     }
@@ -118,15 +118,25 @@ fn env_path(key: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// `$XDG_DATA_HOME/openresearch` else `~/.local/share/openresearch` — the tail
-/// of the resolution chain, shared by `data_dir()` and `default_data_dir()`.
+/// The platform data directory — `$XDG_DATA_HOME/openresearch` or
+/// `~/.local/share/openresearch` on Unix, `%LOCALAPPDATA%\OpenResearch` on
+/// Windows. Shared by `data_dir()` and `default_data_dir()`.
 fn xdg_default_data_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        dirs::data_local_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("OpenResearch")
+    }
+    #[cfg(not(windows))]
     let base = env_path("XDG_DATA_HOME").unwrap_or_else(|| {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".local")
             .join("share")
     });
+    #[cfg(not(windows))]
     base.join("openresearch")
 }
 

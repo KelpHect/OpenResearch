@@ -574,6 +574,16 @@ pub async fn detect_harnesses() -> Vec<HarnessInfo> {
 pub(crate) fn xdg_config_home() -> PathBuf {
     // Ignore an unset *or* empty value — a set-but-empty XDG_CONFIG_HOME would
     // otherwise resolve to a relative `opencode/` path under the cwd.
+    #[cfg(windows)]
+    {
+        crate::local::shell_env::var("XDG_CONFIG_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(dirs::config_dir)
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+    #[cfg(not(windows))]
     crate::local::shell_env::var("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)

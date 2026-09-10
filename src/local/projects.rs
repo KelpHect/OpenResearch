@@ -288,6 +288,7 @@ mod tests {
             project_slug_preview(&store, "nanochat").unwrap(),
             "nanochat-2"
         );
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -315,6 +316,7 @@ mod tests {
             std::fs::canonicalize(&project_path).unwrap()
         );
         assert!(git::remotes(&project_path).unwrap().is_empty());
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -340,6 +342,7 @@ mod tests {
 
         assert!(error.to_string().contains("choose a new folder"));
         assert!(store.list_local_projects().unwrap().is_empty());
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -366,6 +369,7 @@ mod tests {
             Path::new(&project.repo_path),
             std::fs::canonicalize(project_path).unwrap()
         );
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -395,6 +399,7 @@ mod tests {
             Path::new(&project.repo_path),
             std::fs::canonicalize(&project_path).unwrap()
         );
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -426,6 +431,7 @@ mod tests {
             git_output(repo_path, &["ls-tree", "-r", "--name-only", "HEAD"]),
             PAPER_PDF_NAME
         );
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -450,6 +456,7 @@ mod tests {
         let error = paper_project(&store, &repository).unwrap_err().to_string();
         assert!(error.contains("must be empty"), "{error}");
         assert!(!repository.join(PAPER_PDF_NAME).exists());
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -482,6 +489,7 @@ mod tests {
         );
         assert!(!project_path.join(".gitignore").exists());
         assert!(git::is_clean(&project_path).unwrap());
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -526,6 +534,7 @@ mod tests {
             "untracked"
         );
         assert!(git::is_clean(&project_path).unwrap());
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -550,6 +559,7 @@ mod tests {
         assert!(error.to_string().contains("not a valid Git repository"));
         assert!(!project_path.join(".git/HEAD").exists());
         assert!(store.list_local_projects().unwrap().is_empty());
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -590,6 +600,7 @@ mod tests {
                 .count(),
             1
         );
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -622,6 +633,7 @@ mod tests {
         assert!(committed.contains("data/.gitignore"));
         assert!(!committed.contains("checkpoint.bin"));
         assert!(large_file.exists());
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -655,6 +667,7 @@ mod tests {
         );
         assert!(large_file.exists());
         assert!(git::is_clean(&project_path).unwrap());
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -698,6 +711,7 @@ mod tests {
             std::fs::read_to_string(&shared_ignore).unwrap(),
             "shared rule\n"
         );
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -746,6 +760,7 @@ mod tests {
             std::fs::read_to_string(&shared_ignore).unwrap(),
             "shared rule\n"
         );
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -780,6 +795,7 @@ mod tests {
         assert!(nested.join(".git").exists());
         assert!(nested.join("draft.md").exists());
         assert!(git::is_clean(&project_path).unwrap());
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -807,6 +823,7 @@ mod tests {
             git_output(&project_path, &["ls-tree", "HEAD", "nested"]).starts_with("160000 commit ")
         );
         assert!(nested.join("README.md").exists());
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -841,6 +858,7 @@ mod tests {
         assert!(nested.join(".git").exists());
         assert!(nested.join("checkpoint.bin").exists());
         assert!(git::is_clean(&project_path).unwrap());
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -876,6 +894,7 @@ mod tests {
         assert!(!project_path.join(".git").exists());
         assert!(!project_path.join(".gitignore").exists());
         assert!(store.list_local_projects().unwrap().is_empty());
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -921,6 +940,7 @@ mod tests {
         );
         assert!(!project_path.join(".git").exists());
         assert!(store.list_local_projects().unwrap().is_empty());
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -953,6 +973,7 @@ mod tests {
         );
         assert!(!project_path.join(".gitignore").exists());
         assert!(project_path.join("local-checkpoint.bin").exists());
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -990,6 +1011,7 @@ mod tests {
             git_output(&project_path, &["rev-list", "--count", "HEAD"]),
             "1"
         );
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1024,6 +1046,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("detached HEAD"));
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1050,6 +1073,7 @@ mod tests {
         assert_eq!(remotes[0].0, "upstream");
         assert!(!remotes.iter().any(|(name, _)| name == "origin"));
         assert!(project.github_owner.is_empty());
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1078,6 +1102,7 @@ mod tests {
         assert!(!project.github_enabled());
         assert_eq!(project.github_owner, "example");
         assert_eq!(project.github_repo, "research");
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1106,6 +1131,7 @@ mod tests {
         assert!(!project.github_enabled());
         assert_eq!(project.github_owner, "example");
         assert_eq!(project.github_repo, "research");
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1128,6 +1154,7 @@ mod tests {
             Path::new(&project.repo_path),
             std::fs::canonicalize(project_path).unwrap()
         );
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1165,6 +1192,7 @@ mod tests {
             git_output(&project_path, &["ls-tree", "-r", "--name-only", "HEAD"]),
             ".gitignore\nREADME.md"
         );
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

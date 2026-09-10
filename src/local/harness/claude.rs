@@ -27,7 +27,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 
 use super::detect::{
     bin_version, nonempty_str, parse_version, probe_bin, read_json, HarnessAuthState, HarnessInfo,
@@ -117,7 +116,7 @@ fn parse_auth_status(success: bool, stdout: &[u8]) -> AuthProbe {
 }
 
 async fn probe_auth(bin: &Path) -> AuthProbe {
-    let mut cmd = Command::new(bin);
+    let mut cmd = crate::sys::tokio_command(bin);
     cmd.args(["auth", "status", "--json"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -193,7 +192,7 @@ pub(crate) fn auth_recovery_note() -> &'static str {
 /// Any failure reports unsupported: a missing choice is a smaller harm than a
 /// choice that silently runs at the default effort.
 async fn claude_accepts_ultracode(bin: &Path) -> bool {
-    let mut cmd = Command::new(bin);
+    let mut cmd = crate::sys::tokio_command(bin);
     cmd.args(["--effort", CLAUDE_ULTRACODE, "--version"])
         .stdin(Stdio::null());
     prepare_env(&mut cmd);
@@ -223,7 +222,7 @@ async fn claude_accepts_ultracode(bin: &Path) -> bool {
 /// caller falls back to the static table.
 async fn claude_list_models(bin: &Path, ultracode: bool) -> Option<Vec<ModelInfo>> {
     let fut = async {
-        let mut cmd = Command::new(bin);
+        let mut cmd = crate::sys::tokio_command(bin);
         cmd.args([
             "--print",
             "--input-format",
@@ -377,7 +376,7 @@ async fn claude_one_shot(bin: &Path, request: OneShot<'_>) -> Option<String> {
         OneShotQuality::Cheap => "haiku",
         OneShotQuality::Standard => "sonnet",
     };
-    let mut cmd = Command::new(bin);
+    let mut cmd = crate::sys::tokio_command(bin);
     cmd.args([
         "-p",
         request.prompt,
@@ -435,10 +434,19 @@ async fn claude_one_shot(bin: &Path, request: OneShot<'_>) -> Option<String> {
 pub(crate) fn find_claude() -> Option<PathBuf> {
     find_on_path("claude").or_else(|| {
         let home = dirs::home_dir()?;
-        [".claude/local/claude", ".local/bin/claude"]
-            .iter()
-            .map(|rel| home.join(rel))
-            .find(|c| c.is_file())
+        #[cfg(windows)]
+        let candidates = [
+            home.join(".claude/local/claude.exe"),
+            home.join(".claude/local/claude.cmd"),
+            home.join(".local/bin/claude.exe"),
+            home.join(".local/bin/claude.cmd"),
+        ];
+        #[cfg(not(windows))]
+        let candidates = [
+            home.join(".claude/local/claude"),
+            home.join(".local/bin/claude"),
+        ];
+        candidates.into_iter().find(|candidate| candidate.is_file())
     })
 }
 

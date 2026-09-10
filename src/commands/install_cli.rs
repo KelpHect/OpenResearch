@@ -14,6 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{anyhow, Result};
+#[cfg(not(windows))]
 use crate::updates::{self, InstallChannel};
 
 /// What `install` did, so the dashboard can report it without parsing prose.
@@ -44,11 +45,11 @@ pub fn install(force: bool) -> Result<Installed> {
     let dir = local_bin();
     std::fs::create_dir_all(&dir)
         .map_err(|e| anyhow!("Could not create {}: {}", dir.display(), e))?;
-    let link = dir.join("orx");
+    let link = dir.join(cli_name());
 
     // Already ours and pointing at this bundle: nothing to do, and nothing below
     // should be able to turn that into an error.
-    if std::fs::read_link(&link).is_ok_and(|current| current == target) {
+    if is_current_link(&link, &target) {
         return Ok(Installed {
             link,
             target,
@@ -96,14 +97,7 @@ pub fn install(force: bool) -> Result<Installed> {
         Err(_) => {}
     }
 
-    std::os::unix::fs::symlink(&target, &link).map_err(|e| {
-        anyhow!(
-            "Could not link {} -> {}: {}",
-            link.display(),
-            target.display(),
-            e
-        )
-    })?;
+    create_cli_link(&target, &link)?;
 
     Ok(Installed {
         on_path: dir_on_path(&dir),
@@ -126,13 +120,28 @@ pub async fn run(args: crate::InstallCliArgs) -> Result<()> {
     }
     if !installed.on_path {
         let dir = installed.link.parent().unwrap_or(&installed.link);
-        println!(
-            "\n{} is not on your PATH. Add this to your shell profile:\n\n  export PATH=\"{}:$PATH\"",
-            dir.display(),
-            dir.display()
-        );
+        println!("\n{}", path_instruction(dir));
     }
     Ok(())
+}
+
+fn path_instruction(dir: &Path) -> String {
+    #[cfg(windows)]
+    {
+        format!(
+            "{} is not on your PATH. Add this to your PowerShell profile:\n\n  $env:Path = \"{};$env:Path\"",
+            dir.display(),
+            dir.display()
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        format!(
+            "{} is not on your PATH. Add this to your shell profile:\n\n  export PATH=\"{}:$PATH\"",
+            dir.display(),
+            dir.display()
+        )
+    }
 }
 
 /// The bundle's `orx` alias. Deliberately the alias and not the bundle
@@ -140,6 +149,15 @@ pub async fn run(args: crate::InstallCliArgs) -> Result<()> {
 /// (see `commands::app::is_bundle_exe_launch`), so a link named `orx` pointing
 /// at `orx` keeps a bare `orx` in a terminal a plain CLI.
 fn bundle_cli_path() -> Result<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        // Windows has no `.app` bundle. The running executable is the CLI
+        // payload, and copying it avoids requiring Developer Mode/admin rights
+        // for a symlink installation.
+        std::env::current_exe()
+            .map_err(|error| anyhow!("Could not locate the running orx binary: {error}"))
+    }
+    #[cfg(not(target_os = "windows"))]
     match updates::current_channel()? {
         InstallChannel::AppBundle(root) => Ok(root.join("Contents/MacOS/orx")),
         channel => Err(anyhow!(
@@ -150,11 +168,77 @@ fn bundle_cli_path() -> Result<PathBuf> {
     }
 }
 
+fn cli_name() -> &'static str {
+    #[cfg(windows)]
+    {
+        "orx.exe"
+    }
+    #[cfg(not(windows))]
+    {
+        "orx"
+    }
+}
+
 fn local_bin() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".local")
-        .join("bin")
+    #[cfg(windows)]
+    {
+        dirs::data_local_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("OpenResearch")
+            .join("bin")
+    }
+    #[cfg(not(windows))]
+    {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".local")
+            .join("bin")
+    }
+}
+
+fn is_current_link(link: &Path, target: &Path) -> bool {
+    if std::fs::read_link(link).is_ok_and(|current| current == target) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // A copied executable is the portable Windows equivalent of the Unix
+        // symlink. Compare bytes so an update is installed when the target
+        // changes, while repeated installs remain idempotent.
+        match (std::fs::read(link), std::fs::read(target)) {
+            (Ok(link), Ok(target)) => link == target,
+            _ => false,
+        }
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+fn create_cli_link(target: &Path, link: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).map_err(|e| {
+            anyhow!(
+                "Could not link {} -> {}: {}",
+                link.display(),
+                target.display(),
+                e
+            )
+        })?;
+    }
+    #[cfg(windows)]
+    {
+        std::fs::copy(target, link).map_err(|e| {
+            anyhow!(
+                "Could not install {} from {}: {}",
+                link.display(),
+                target.display(),
+                e
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn dir_on_path(dir: &Path) -> bool {
@@ -168,8 +252,21 @@ fn dir_on_path(dir: &Path) -> bool {
 /// canonicalization so a PATH entry that is itself a symlink to the link's
 /// directory (`~/bin` -> `~/.local/bin`) isn't mistaken for a rival install.
 fn other_orx_on_path(link: &Path) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let candidate = crate::local::shell_env::find_on_path("orx")?;
+        let link_real = link.canonicalize();
+        match (candidate.canonicalize(), link_real) {
+            (Ok(candidate), Ok(link)) if candidate == link => None,
+            (Ok(candidate), _) => Some(candidate),
+            (Err(_), _) => Some(candidate),
+        }
+    }
+    #[cfg(not(windows))]
     let paths = crate::local::shell_env::search_path()?;
+    #[cfg(not(windows))]
     let link_real = link.canonicalize();
+    #[cfg(not(windows))]
     std::env::split_paths(&paths)
         .filter(|dir| !dir.as_os_str().is_empty())
         .map(|dir| dir.join("orx"))

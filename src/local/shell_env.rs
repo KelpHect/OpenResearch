@@ -18,6 +18,8 @@
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
+#[cfg(windows)]
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -62,6 +64,26 @@ fn search_in(paths: &OsStr, binary: &str) -> Option<PathBuf> {
     // A relative entry (`""`, meaning cwd, or `bin`) names no fixed directory —
     // it resolves against whichever cwd is current, so it is never a place to
     // pick up a binary.
+    #[cfg(windows)]
+    {
+        let mut names = vec![binary.to_string()];
+        if Path::new(binary).extension().is_none() {
+            let extensions = std::env::var_os("PATHEXT")
+                .map(|value| value.to_string_lossy().into_owned())
+                .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+            names.extend(
+                extensions
+                    .split(';')
+                    .filter(|extension| !extension.is_empty())
+                    .map(|extension| format!("{binary}{extension}")),
+            );
+        }
+        std::env::split_paths(paths)
+            .filter(|dir| dir.is_absolute())
+            .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
+            .find(|candidate| candidate.is_file())
+    }
+    #[cfg(not(windows))]
     std::env::split_paths(paths)
         .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(binary))
@@ -137,13 +159,24 @@ mod tests {
         let (early, late) = (root.join("early"), root.join("late"));
         std::fs::create_dir_all(&early).expect("early");
         std::fs::create_dir_all(&late).expect("late");
-        std::fs::write(early.join("tool"), "").expect("early tool");
-        std::fs::write(late.join("tool"), "").expect("late tool");
+        #[cfg(not(windows))]
+        let tool_name = "tool";
+        #[cfg(windows)]
+        let tool_name = "tool.exe";
+        std::fs::write(early.join(tool_name), "").expect("early tool");
+        std::fs::write(late.join(tool_name), "").expect("late tool");
 
         let paths =
             std::env::join_paths([PathBuf::new(), PathBuf::from("bin"), early.clone(), late])
                 .expect("join");
-        assert_eq!(search_in(&paths, "tool"), Some(early.join("tool")));
+        #[cfg(not(windows))]
+        assert_eq!(search_in(&paths, "tool"), Some(early.join(tool_name)));
+        #[cfg(windows)]
+        assert!(search_in(&paths, "tool").is_some_and(|found| {
+            found
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&early.join(tool_name).to_string_lossy())
+        }));
         assert_eq!(search_in(&paths, "absent"), None);
 
         // A relative entry is rejected even when it does resolve: cargo runs
@@ -156,14 +189,18 @@ mod tests {
 
     #[test]
     fn reads_every_imported_variable() {
+        #[cfg(not(windows))]
+        let path = "/opt/homebrew/bin:/usr/bin";
+        #[cfg(windows)]
+        let path = r"C:\Program Files\OpenResearch;C:\Windows\System32";
         let vars = parse_probe(
-            &fenced(
-                "/opt/homebrew/bin:/usr/bin\0/data\0/share\0/config\0/open.db\0/claude\0/secure\0/codex\0",
-            ),
+            &fenced(&format!(
+                "{path}\0/data\0/share\0/config\0/open.db\0/claude\0/secure\0/codex\0"
+            )),
             M,
         )
         .unwrap();
-        assert_eq!(vars["PATH"], OsString::from("/opt/homebrew/bin:/usr/bin"));
+        assert_eq!(vars["PATH"], OsString::from(path));
         assert_eq!(vars["ORX_DATA_DIR"], OsString::from("/data"));
         assert_eq!(vars["XDG_DATA_HOME"], OsString::from("/share"));
         assert_eq!(vars["XDG_CONFIG_HOME"], OsString::from("/config"));
@@ -178,8 +215,12 @@ mod tests {
 
     #[test]
     fn unset_variables_are_dropped_so_lookups_fall_through() {
-        let vars = parse_probe(&fenced("/usr/bin\0\0\0\0\0\0\0\0"), M).unwrap();
-        assert_eq!(vars["PATH"], OsString::from("/usr/bin"));
+        #[cfg(not(windows))]
+        let path = "/usr/bin";
+        #[cfg(windows)]
+        let path = r"C:\Windows\System32";
+        let vars = parse_probe(&fenced(&format!("{path}\0\0\0\0\0\0\0\0")), M).unwrap();
+        assert_eq!(vars["PATH"], OsString::from(path));
         assert!(!vars.contains_key("ORX_DATA_DIR"));
         assert!(!vars.contains_key("OPENCODE_DB"));
         assert!(!vars.contains_key("CLAUDE_CONFIG_DIR"));

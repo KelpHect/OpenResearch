@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::json;
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::sync::Mutex;
 
 use crate::error::{anyhow, Result};
@@ -213,9 +213,14 @@ fn playbook_md(project: &LocalProject, state: &ProjectState) -> String {
         .map(|skill| format!("- `{}`", skill.name))
         .collect::<Vec<_>>()
         .join("\n");
+    // The checked-in template is text and therefore arrives with CRLF on a
+    // normal Windows checkout. Split at the comment delimiter itself rather
+    // than at one exact line-ending spelling, otherwise the documentation
+    // comment (including its literal `{token}` example) leaks into the agent
+    // prompt.
     let template = SYSTEM_PROMPT
-        .split_once("-->\n\n")
-        .map(|(_, rest)| rest)
+        .split_once("-->")
+        .map(|(_, rest)| rest.trim_start_matches(['\r', '\n']))
         .unwrap_or(SYSTEM_PROMPT);
     template
         .replace("{name}", name)
@@ -451,7 +456,7 @@ async fn spawn_agent(
         .open(agent_log_path())
         .map_err(|e| anyhow!("Could not open {}: {}", agent_log_path().display(), e))?;
 
-    let mut cmd = Command::new(&bin);
+    let mut cmd = crate::sys::tokio_command(&bin);
     cmd.arg("serve")
         .arg("--port")
         .arg(port.to_string())
@@ -483,8 +488,7 @@ async fn spawn_agent(
     }
     // Own process group: a terminal SIGINT reaches orx up alone, which then
     // tears the child down deliberately (kill_on_drop / shutdown()).
-    #[cfg(unix)]
-    cmd.process_group(0);
+    crate::sys::new_process_group_tokio(&mut cmd);
 
     let mut child = cmd
         .spawn()

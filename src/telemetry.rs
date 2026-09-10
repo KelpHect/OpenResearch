@@ -1109,6 +1109,7 @@ pub(crate) fn capture_experiment_started(kind: &str, local: bool, target: Option
 mod tests {
     use super::*;
     use std::sync::{Mutex, MutexGuard};
+    use tokio::io::AsyncReadExt as _;
 
     // Serializes the telemetry tests below, which mutate the process-global
     // variables in OPT_VARS. IMPORTANT: this lock
@@ -1152,6 +1153,36 @@ mod tests {
     }
 
     const OPT_VARS: &[&str] = &["XDG_CONFIG_HOME", "ORX_TELEMETRY_ENV", "ORX_TELEMETRY_HOST"];
+
+    // Windows can reset a socket when a test server writes its response before
+    // the client has finished uploading the JSON body. Consume the request in
+    // the response-only fixtures so the tests exercise HTTP status handling,
+    // not an OS-specific half-closed connection race.
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        while let Ok(read) = stream.read(&mut buffer).await {
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..read]);
+            let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .and_then(|value| value.parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            if bytes.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+    }
 
     #[test]
     fn environment_policy_is_fail_closed_and_downgrade_only() {
@@ -1785,6 +1816,7 @@ mod tests {
                 "202 Accepted",
             ] {
                 let (mut stream, _) = listener.accept().await.unwrap();
+                read_http_request(&mut stream).await;
                 let response =
                     format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                 stream.write_all(response.as_bytes()).await.unwrap();
@@ -1819,6 +1851,7 @@ mod tests {
         );
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_request(&mut stream).await;
             stream
                 .write_all(
                     b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",

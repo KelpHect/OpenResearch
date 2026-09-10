@@ -148,7 +148,7 @@ fn codex_model_reasoning(model: &str) -> Option<&'static [&'static str]> {
 /// (the server already filters them by default; the guard is belt-and-braces).
 async fn codex_model_list(bin: &Path, configured_effort: Option<&str>) -> Option<Vec<ModelInfo>> {
     let fut = async {
-        let mut cmd = Command::new(bin);
+        let mut cmd = crate::sys::tokio_command(bin);
         cmd.arg("app-server")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -408,7 +408,7 @@ async fn codex_one_shot(bin: &Path, request: OneShot<'_>) -> Option<String> {
     };
     let message = format!("{}\n\n{}", request.system, request.prompt);
     let fut = async {
-        let mut cmd = Command::new(bin);
+        let mut cmd = crate::sys::tokio_command(bin);
         cmd.args(["exec", "--ephemeral", "--json", "--skip-git-repo-check"])
             .args(["-c", "sandbox_mode=\"read-only\""])
             .args(["-c", "approval_policy=\"never\""])
@@ -3245,7 +3245,7 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
     let codex_home = tokio::task::spawn_blocking(move || native_store::prepare_codex(native_store))
         .await
         .map_err(|error| anyhow!("Codex config preparation failed: {error}"))??;
-    let mut cmd = Command::new(&bin);
+    let mut cmd = crate::sys::tokio_command(&bin);
     match (&ctx.native_session_id, &native_session) {
         (Some(native_id), Some(_)) => {
             cmd.args(["exec", "resume", native_id]);

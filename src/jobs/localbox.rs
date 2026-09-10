@@ -13,7 +13,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::error::{anyhow, Result};
-use crate::jobs::ssh::{sh_quote, JobState};
+#[cfg(unix)]
+use crate::jobs::ssh::sh_quote;
+use crate::jobs::ssh::JobState;
 
 /// The run's working directory: `<data dir>/local-runs/<run id>`.
 pub fn run_dir(run_id: &str) -> PathBuf {
@@ -28,7 +30,8 @@ pub fn run_dir(run_id: &str) -> PathBuf {
 pub struct LocalJobSpec {
     /// Names the run dir `<data dir>/local-runs/<run_id>`.
     pub run_id: String,
-    /// The shared clone-and-run payload (`bash` script body).
+    /// The shared clone-and-run payload (POSIX shell on Unix, PowerShell on
+    /// Windows).
     pub script: String,
     /// Exported inside run.sh (tokens, synced env) — written owner-only.
     pub env: HashMap<String, String>,
@@ -47,41 +50,94 @@ pub fn run_job(spec: &LocalJobSpec) -> Result<PathBuf> {
     // we tail) live instead of block-buffering behind the redirect (see
     // jobs::default_unbuffered).
     let env = super::default_unbuffered(&spec.env);
+    #[cfg(unix)]
     let exports: String = env
         .iter()
         .map(|(k, v)| format!("export {}={}", k, sh_quote(v)))
         .collect::<Vec<_>>()
         .join("\n");
-    // Same subshell shape as the ssh backend: an `exit`/`set -e` failure inside
-    // `( … )` ends the subshell, not run.sh, so exit_code is always written.
-    let run_sh = format!(
+    #[cfg(windows)]
+    let exports: String = env
+        .iter()
+        .map(|(key, value)| format!("$env:{key} = {}", crate::sys::ps_quote(value)))
+        .collect::<Vec<_>>()
+        .join("\r\n");
+
+    #[cfg(unix)]
+    let launcher_path = dir.join("run.sh");
+    #[cfg(unix)]
+    let launcher = format!(
         "#!/usr/bin/env bash\n{exports}\ncd {dir} || exit 97\n(\n{script}\n) > log 2>&1\necho $? > exit_code\n",
         dir = sh_quote(&dir.to_string_lossy()),
         script = spec.script,
     );
-    let run_sh_path = dir.join("run.sh");
-    std::fs::write(&run_sh_path, run_sh)
-        .map_err(|e| anyhow!("Could not write {}: {}", run_sh_path.display(), e))?;
+    #[cfg(windows)]
+    let launcher_path = dir.join("run.ps1");
+    #[cfg(windows)]
+    let payload_path = dir.join("payload.ps1");
+    #[cfg(windows)]
+    let launcher = format!(
+        concat!(
+            "$ErrorActionPreference = 'Stop'\r\n{exports}\r\n",
+            "$log = Join-Path -Path $PSScriptRoot -ChildPath 'log'\r\n",
+            "$exitFile = Join-Path -Path $PSScriptRoot -ChildPath 'exit_code'\r\n",
+            "$global:LASTEXITCODE = 0\r\n",
+            "$exitCode = 0\r\n",
+            "try {{\r\n",
+            "    $payload = Join-Path -Path $PSScriptRoot -ChildPath 'payload.ps1'\r\n",
+            "    $items = @(& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $payload *>&1)\r\n",
+            "    $pipelineSuccess = $?\r\n",
+            "    $nativeExitCode = $LASTEXITCODE\r\n",
+            "    $text = $items | Out-String\r\n",
+            "    $encoding = New-Object System.Text.UTF8Encoding($false)\r\n",
+            "    [System.IO.File]::WriteAllText($log, [string]$text, $encoding)\r\n",
+            "    if ($null -ne $nativeExitCode -and $nativeExitCode -ne 0) {{ $exitCode = [int]$nativeExitCode }}\r\n",
+            "    elseif (-not $pipelineSuccess) {{ $exitCode = 1 }}\r\n",
+            "}} catch {{\r\n",
+            "    $encoding = New-Object System.Text.UTF8Encoding($false)\r\n",
+            "    [System.IO.File]::WriteAllText($log, $_.ToString() + [Environment]::NewLine, $encoding)\r\n",
+            "    $exitCode = 1\r\n",
+            "}}\r\n",
+            "Set-Content -LiteralPath $exitFile -Value $exitCode\r\n",
+            "exit $exitCode\r\n",
+        ),
+        exports = exports,
+    );
+    std::fs::write(&launcher_path, launcher)
+        .map_err(|e| anyhow!("Could not write {}: {}", launcher_path.display(), e))?;
+    #[cfg(windows)]
+    std::fs::write(&payload_path, &spec.script)
+        .map_err(|e| anyhow!("Could not write {}: {}", payload_path.display(), e))?;
     #[cfg(unix)]
     {
         // run.sh carries exported tokens — keep both it and the dir owner-only.
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-        let _ = std::fs::set_permissions(&run_sh_path, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(&launcher_path, std::fs::Permissions::from_mode(0o600));
     }
 
+    #[cfg(unix)]
     let mut cmd = std::process::Command::new("bash");
-    cmd.arg("run.sh")
-        .envs(&spec.secret_env)
+    #[cfg(unix)]
+    cmd.arg("run.sh");
+    #[cfg(windows)]
+    let mut cmd = std::process::Command::new("powershell.exe");
+    #[cfg(windows)]
+    cmd.args([
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "run.ps1",
+    ]);
+    cmd.envs(&spec.secret_env)
         .current_dir(&dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
+    crate::sys::detach(&mut cmd);
     let child = cmd
         .spawn()
         .map_err(|e| anyhow!("Could not launch the local run: {}", e))?;
@@ -90,22 +146,10 @@ pub fn run_job(spec: &LocalJobSpec) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Is the recorded process still alive? `ps` rather than `kill -0`: a zombie
-/// (dead but not yet reaped by a still-living spawner) answers `kill -0` yet
-/// is not running. No libc dependency; works on macOS and Linux.
+/// Is the recorded process still alive? Uses `ps` on Unix and `tasklist` on
+/// Windows, avoiding a platform-specific process API in the job format.
 fn pid_alive(pid: &str) -> bool {
-    match std::process::Command::new("ps")
-        .args(["-o", "stat=", "-p", pid])
-        .stderr(std::process::Stdio::null())
-        .output()
-    {
-        Ok(o) if o.status.success() => {
-            let stat = String::from_utf8_lossy(&o.stdout);
-            let stat = stat.trim();
-            !stat.is_empty() && !stat.starts_with('Z')
-        }
-        _ => false,
-    }
+    crate::sys::pid_alive(pid)
 }
 
 /// The terminal state recorded in exit_code, if any. An empty file is run.sh
@@ -189,30 +233,14 @@ pub fn stream_logs(dir: &Path, skip: u64, sink: &mut (dyn FnMut(&str) + Send)) -
     Ok(seen)
 }
 
-/// Cancel = TERM the process group (pid == pgid under `process_group(0)`);
-/// fall back to the pid alone if the group kill is refused.
+/// Cancel the launcher and its descendants. Unix uses the process group;
+/// Windows uses `taskkill /T` for the equivalent process-tree operation.
 pub fn cancel_job(dir: &Path) -> Result<()> {
     let pid = std::fs::read_to_string(dir.join("pid"))
         .map_err(|e| anyhow!("Could not read the run's pid: {}", e))?;
     let pid = pid.trim().to_string();
-    let group = std::process::Command::new("kill")
-        .args(["-TERM", "--", &format!("-{pid}")])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !group {
-        let process = std::process::Command::new("kill")
-            .args(["-TERM", &pid])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-        if !process {
-            return Err(anyhow!("Could not terminate local process group {pid}"));
-        }
+    if !crate::sys::kill_tree(&pid) {
+        return Err(anyhow!("Could not terminate local process tree {pid}"));
     }
     Ok(())
 }
@@ -353,9 +381,14 @@ mod tests {
         let base = std::env::temp_dir().join(format!("orx-localbox-test-{}", std::process::id()));
         std::env::set_var("ORX_DATA_DIR", &base);
 
+        #[cfg(unix)]
+        let lifecycle_script = "[ -n \"$TINKER_API_KEY\" ] && echo hello-$ORX_TEST_VAR";
+        #[cfg(windows)]
+        let lifecycle_script =
+            "if ($env:TINKER_API_KEY) { Write-Output \"hello-$env:ORX_TEST_VAR\" }";
         let dir = run_job(&LocalJobSpec {
             run_id: "lifecycle".into(),
-            script: "[ -n \"$TINKER_API_KEY\" ] && echo hello-$ORX_TEST_VAR".into(),
+            script: lifecycle_script.into(),
             env: HashMap::from([("ORX_TEST_VAR".to_string(), "42".to_string())]),
             secret_env: HashMap::from([("TINKER_API_KEY".to_string(), "s3cr3t-value".to_string())]),
         })
@@ -363,9 +396,15 @@ mod tests {
         let state = wait_terminal(&dir);
         assert_eq!(state.stage, "COMPLETED", "message: {:?}", state.message);
         // Python is defaulted to unbuffered so tailed-`log` output streams live.
-        let run_sh = std::fs::read_to_string(dir.join("run.sh")).unwrap();
-        assert!(run_sh.contains("export PYTHONUNBUFFERED='1'\n"));
-        assert!(!run_sh.contains("s3cr3t-value"));
+        #[cfg(unix)]
+        let launcher = std::fs::read_to_string(dir.join("run.sh")).unwrap();
+        #[cfg(windows)]
+        let launcher = std::fs::read_to_string(dir.join("run.ps1")).unwrap();
+        #[cfg(unix)]
+        assert!(launcher.contains("export PYTHONUNBUFFERED='1'\n"));
+        #[cfg(windows)]
+        assert!(launcher.contains("$env:PYTHONUNBUFFERED = '1'"));
+        assert!(!launcher.contains("s3cr3t-value"));
 
         let mut lines = Vec::new();
         let seen = stream_logs(&dir, 0, &mut |l| lines.push(l.to_string())).unwrap();
@@ -374,9 +413,13 @@ mod tests {
         // Re-poll past the consumed lines: nothing new.
         assert_eq!(stream_logs(&dir, seen, &mut |_| ()).unwrap(), seen);
 
+        #[cfg(unix)]
+        let failed_script = "exit 3";
+        #[cfg(windows)]
+        let failed_script = "exit 3";
         let failed = run_job(&LocalJobSpec {
             run_id: "failing".into(),
-            script: "exit 3".into(),
+            script: failed_script.into(),
             env: HashMap::new(),
             secret_env: HashMap::new(),
         })
@@ -385,9 +428,13 @@ mod tests {
         assert_eq!(state.stage, "ERROR");
         assert_eq!(state.message.as_deref(), Some("exited with code 3"));
 
+        #[cfg(unix)]
+        let cancelled_script = "sleep 60";
+        #[cfg(windows)]
+        let cancelled_script = "Start-Sleep -Seconds 60";
         let cancelled = run_job(&LocalJobSpec {
             run_id: "cancelled".into(),
-            script: "sleep 60".into(),
+            script: cancelled_script.into(),
             env: HashMap::new(),
             secret_env: HashMap::new(),
         })

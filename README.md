@@ -26,6 +26,13 @@ curl -LsSf https://openresearch.sh/install.sh | sh
 orx up
 ```
 
+On Windows, run the PowerShell installer:
+
+```powershell
+irm https://github.com/alphaXiv/OpenResearch/releases/latest/download/openresearch-cli-installer.ps1 | iex
+orx up
+```
+
 `orx up` opens the local dashboard at `http://127.0.0.1:4791`.
 
 To use LM Studio, oMLX, Ollama, or a custom endpoint with OpenCode, see

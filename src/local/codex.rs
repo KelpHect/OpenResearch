@@ -22,7 +22,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::error::{anyhow, Result};
@@ -570,7 +570,7 @@ async fn spawn_client(
     })
     .await
     .map_err(|error| anyhow!("Codex config preparation failed: {error}"))??;
-    let mut cmd = Command::new(&bin);
+    let mut cmd = crate::sys::tokio_command(&bin);
     cmd.arg("app-server");
     if let Some(override_arg) = native_store::codex_sqlite_override(native_store, &codex_home) {
         cmd.args(["-c", &override_arg]);
@@ -596,8 +596,7 @@ async fn spawn_client(
     }
     // Own process group: a terminal SIGINT reaches orx up alone, which then
     // tears the child down deliberately (kill_on_drop / shutdown()).
-    #[cfg(unix)]
-    cmd.process_group(0);
+    crate::sys::new_process_group_tokio(&mut cmd);
 
     let mut child = cmd
         .spawn()

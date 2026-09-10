@@ -563,7 +563,7 @@ async fn opencode_child(
     message: &str,
     timeout: Duration,
 ) -> Option<std::process::Output> {
-    let mut cmd = tokio::process::Command::new(bin);
+    let mut cmd = crate::sys::tokio_command(bin);
     cmd.args(["run", "--agent", "plan", "--pure"])
         .args(model.iter().flat_map(|model| ["--model", model]))
         .arg(message)
@@ -585,7 +585,7 @@ async fn opencode_child(
 
 /// Run `opencode <args>` in the home dir, returning stdout on success.
 async fn run_models(bin: &PathBuf, args: &[&str]) -> Option<String> {
-    let mut cmd = tokio::process::Command::new(bin);
+    let mut cmd = crate::sys::tokio_command(bin);
     cmd.args(args)
         .current_dir(dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
         .stdin(std::process::Stdio::null());

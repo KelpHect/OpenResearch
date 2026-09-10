@@ -2,11 +2,12 @@
 //! installer.
 //!
 //! The mechanism mirrors what axoupdater (uv's `self update`) does: download
-//! the `openresearch-cli-installer.sh` asset from the target release and run
-//! it pinned to the existing install prefix via `CARGO_DIST_FORCE_INSTALL_DIR`.
-//! The installer owns the hard parts — checksum verification and the atomic
-//! rename into `~/.cargo/bin` (never an in-place overwrite, which on macOS
-//! trips the kernel's per-inode code-signature cache and SIGKILLs the binary).
+//! the release installer (`.sh` on Unix, `.ps1` on Windows) and run it pinned
+//! to the existing install prefix via `CARGO_DIST_FORCE_INSTALL_DIR`.
+//! The installer owns the hard parts — checksum verification and installation
+//! into the existing prefix. On Windows the running image is renamed aside
+//! first, because the destination executable cannot be overwritten while it is
+//! open.
 //!
 //! Guards, in order:
 //!   - `OPENRESEARCH_CLI_DISABLE_UPDATE=1` refuses outright (same switch the
@@ -126,24 +127,58 @@ async fn apply(args: crate::UpdateArgs) -> Result<Outcome> {
 
     // Pin the installer to the same release the manifest described, so the
     // version we report is exactly the version that gets installed.
-    let installer = updates::fetch_release_asset(
-        &latest.tag,
-        &format!("{}-installer.sh", updates::APP_NAME),
-        Duration::from_secs(60),
-    )
-    .await?;
+    #[cfg(windows)]
+    let installer_name = format!("{}-installer.ps1", updates::APP_NAME);
+    #[cfg(not(windows))]
+    let installer_name = format!("{}-installer.sh", updates::APP_NAME);
+    let installer =
+        updates::fetch_release_asset(&latest.tag, &installer_name, Duration::from_secs(60)).await?;
+    #[cfg(windows)]
+    let script = std::env::temp_dir().join(format!("orx-installer-{}.ps1", uuid::Uuid::new_v4()));
+    #[cfg(not(windows))]
     let script = std::env::temp_dir().join(format!("orx-installer-{}.sh", uuid::Uuid::new_v4()));
     std::fs::write(&script, &installer)?;
 
+    // Windows permits renaming a running image but not overwriting it. Move the
+    // old image out of the installer's way, then schedule its delayed deletion
+    // only after the installer succeeds. A failed installer restores the old
+    // image before returning the error.
+    #[cfg(windows)]
+    let windows_swap = move_running_executable()?;
+
     // `sh <script>` rather than executing the file: immune to noexec /tmp
-    // mounts. The installer verifies artifact checksums and renames the new
-    // binary into place atomically; replacing a running orx is safe on
-    // macOS/Linux (old processes keep the old inode).
+    // mounts. The installer verifies artifact checksums and installs into the
+    // exact prefix recorded in the receipt.
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut command = std::process::Command::new("powershell.exe");
+        command.args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ]);
+        command.arg(&script);
+        // Avoid inheriting a PowerShell Core module path when invoking Windows
+        // PowerShell; this is the same compatibility guard used by axoupdater.
+        command.env_remove("PSModulePath");
+        command
+    };
+    #[cfg(not(windows))]
     let mut cmd = std::process::Command::new("sh");
-    cmd.arg(&script)
-        .env("CARGO_DIST_FORCE_INSTALL_DIR", &receipt.install_prefix);
+    #[cfg(not(windows))]
+    cmd.arg(&script);
+    cmd.env("CARGO_DIST_FORCE_INSTALL_DIR", &receipt.install_prefix);
     if !receipt.modify_path {
-        cmd.env("OPENRESEARCH_CLI_NO_MODIFY_PATH", "1");
+        // Keep the spellings used by current and older cargo-dist installers.
+        // The current PowerShell installer reads CARGO_DIST_NO_MODIFY_PATH
+        // before writing its receipt; INSTALLER_NO_MODIFY_PATH is consulted
+        // later by older scripts.
+        cmd.env("CARGO_DIST_NO_MODIFY_PATH", "1")
+            .env("INSTALLER_NO_MODIFY_PATH", "1")
+            .env("OPENRESEARCH_CLI_NO_MODIFY_PATH", "1");
     }
     if args.background {
         // Nobody is watching this child, and its stdio is inherited from a
@@ -153,12 +188,53 @@ async fn apply(args: crate::UpdateArgs) -> Result<Outcome> {
     }
     let status = cmd.status();
     let _ = std::fs::remove_file(&script);
-    let status = status.map_err(|e| anyhow!("Could not run the installer: {}", e))?;
+    let status = match status {
+        Ok(status) => status,
+        Err(error) => {
+            #[cfg(windows)]
+            {
+                return Err(match restore_running_executable(&windows_swap) {
+                    Ok(()) => anyhow!("Could not run the installer: {}. The previous orx was restored.", error),
+                    Err(restore_error) => anyhow!(
+                        "Could not run the installer: {}, and restoring the previous orx failed: {}. It is at {}.",
+                        error,
+                        restore_error,
+                        windows_swap.0.display()
+                    ),
+                });
+            }
+            #[cfg(not(windows))]
+            return Err(anyhow!("Could not run the installer: {}", error));
+        }
+    };
     if !status.success() {
+        #[cfg(windows)]
+        return Err(match restore_running_executable(&windows_swap) {
+            Ok(()) => anyhow!(
+                "The installer exited with {}. The previous orx was restored.",
+                status
+            ),
+            Err(error) => anyhow!(
+                "The installer exited with {}, and restoring the previous orx failed: {}. It is at {}.",
+                status,
+                error,
+                windows_swap.0.display()
+            ),
+        });
+        #[cfg(not(windows))]
         return Err(anyhow!(
             "The installer exited with {}. The previous orx is untouched.",
             status
         ));
+    }
+
+    #[cfg(windows)]
+    {
+        // The current process is still running from the renamed image. The
+        // helper arranges for that old image to be removed after this process
+        // exits; failure here must not turn a successful install into a failed
+        // update.
+        let _ = self_replace::self_delete_at(&windows_swap.0);
     }
 
     // Keep the update-check cache in sync so the warning doesn't fire on a stale
@@ -168,4 +244,37 @@ async fn apply(args: crate::UpdateArgs) -> Result<Outcome> {
         println!("✓ Updated orx {} → {}.", current, latest.version);
     }
     Ok(Outcome::Done)
+}
+
+#[cfg(windows)]
+type WindowsSwap = (std::path::PathBuf, std::path::PathBuf);
+
+#[cfg(windows)]
+fn move_running_executable() -> Result<WindowsSwap> {
+    let original = std::env::current_exe()
+        .map_err(|e| anyhow!("Could not locate the running orx binary: {}", e))?;
+    let file_name = original
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("The running orx binary has an invalid filename."))?;
+    let previous = original.with_file_name(format!(
+        "{file_name}.orx-previous-{}.exe",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::rename(&original, &previous).map_err(|e| {
+        anyhow!(
+            "Could not move the running orx aside for update ({}): {}",
+            original.display(),
+            e
+        )
+    })?;
+    Ok((previous, original))
+}
+
+#[cfg(windows)]
+fn restore_running_executable(swap: &WindowsSwap) -> std::io::Result<()> {
+    if swap.1.exists() {
+        std::fs::remove_file(&swap.1)?;
+    }
+    std::fs::rename(&swap.0, &swap.1)
 }

@@ -161,6 +161,15 @@ pub struct Receipt {
 pub fn receipt_path() -> PathBuf {
     // Through `shell_env`, like `config::config_dir()`: in macOS app mode the
     // user's real XDG_CONFIG_HOME lives only in this process.
+    #[cfg(windows)]
+    let base = crate::local::shell_env::var("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .or_else(|| crate::local::shell_env::var("LOCALAPPDATA"))
+        .map(PathBuf::from)
+        .or_else(dirs::data_local_dir)
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("."));
+    #[cfg(not(windows))]
     let base = crate::local::shell_env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -332,8 +341,16 @@ pub fn auto_update_eligible() -> bool {
 }
 
 /// The one-liner that reinstalls orx through the release installer.
-const INSTALL_HINT: &str = "curl --proto '=https' --tlsv1.2 -LsSf \
-https://github.com/alphaXiv/OpenResearch/releases/latest/download/openresearch-cli-installer.sh | sh";
+fn install_hint() -> &'static str {
+    #[cfg(windows)]
+    {
+        "powershell -NoProfile -ExecutionPolicy Bypass -Command \"irm https://github.com/alphaXiv/OpenResearch/releases/latest/download/openresearch-cli-installer.ps1 | iex\""
+    }
+    #[cfg(not(windows))]
+    {
+        "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/alphaXiv/OpenResearch/releases/latest/download/openresearch-cli-installer.sh | sh"
+    }
+}
 
 /// Confirm a directory can be written before an update commits to it — root-owned
 /// installs and read-only filesystems fail here rather than after a download.
@@ -381,7 +398,7 @@ pub fn preflight(force: bool) -> Result<UpdateTarget> {
                  - cargo: cargo install --path . (or your original cargo install invocation)\n\
                  - or reinstall with the installer: {}",
                 receipt_path().display(),
-                INSTALL_HINT
+                install_hint()
             ))
         }
         InstallChannel::Installer { receipt, prefix } => (receipt, prefix),
@@ -590,6 +607,8 @@ fn updater_command() -> Result<tokio::process::Command> {
     // `orx` in — can't land between the two renames that swap the app bundle.
     #[cfg(unix)]
     cmd.process_group(0);
+    #[cfg(windows)]
+    crate::sys::new_process_group_tokio(&mut cmd);
     Ok(cmd)
 }
 
@@ -686,7 +705,7 @@ pub fn status() -> UpdateStatus {
             .as_ref()
             .is_some_and(|latest| is_outdated(&current, latest)),
         restart_required: installed.is_some(),
-        can_restart: cfg!(unix),
+        can_restart: cfg!(any(unix, windows)),
         instance: instance_id(),
         installed_version: installed.map(|v| v.to_string()),
         latest: latest.map(|v| v.to_string()),
@@ -746,11 +765,46 @@ pub fn relaunch(port: u16) -> std::io::Error {
 
 #[cfg(not(unix))]
 pub fn relaunch(_port: u16) -> std::io::Error {
-    std::io::Error::from(std::io::ErrorKind::Unsupported)
+    #[cfg(windows)]
+    {
+        // Windows cannot exec in place, but it can start the newly installed
+        // copy and then let this process exit. The updater may have renamed the
+        // image this server is still running from; recover the original file
+        // name in that case.
+        let exe = match std::env::current_exe() {
+            Ok(exe) => windows_relaunch_target(exe),
+            Err(error) => return error,
+        };
+        let spawned = std::process::Command::new(exe)
+            .args(relaunch_args(std::env::args_os().skip(1)))
+            .spawn();
+        match spawned {
+            Ok(_) => std::process::exit(0),
+            Err(error) => error,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::io::Error::from(std::io::ErrorKind::Unsupported)
+    }
+}
+
+#[cfg(windows)]
+fn windows_relaunch_target(exe: PathBuf) -> PathBuf {
+    let Some(name) = exe.file_name().and_then(|name| name.to_str()) else {
+        return exe;
+    };
+    // `commands::update` uses this suffix for the old image while the new
+    // installer owns the original filename.
+    let Some(original) = name.split_once(".orx-previous-") else {
+        return exe;
+    };
+    exe.with_file_name(original.0)
 }
 
 /// Linux reports a replaced binary as `<path> (deleted)`; the installer put the
 /// new file at `<path>`, which is what to exec.
+#[cfg(unix)]
 fn relaunch_target(exe: PathBuf) -> PathBuf {
     exe.to_str()
         .and_then(|exe| exe.strip_suffix(" (deleted)"))
@@ -1099,10 +1153,12 @@ impl UpdateWarning {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::relaunch_target;
     use super::{
         app_bundle_root, attempt_backoff, attempt_due, bold, detect_channel, exe_matches_prefix,
-        now_unix, parse_manifest, precedence, relaunch_args, relaunch_target, render, warning_for,
-        CheckCache, InstallChannel, ATTEMPT_BACKOFF_MAX, ATTEMPT_BACKOFF_MIN,
+        now_unix, parse_manifest, precedence, relaunch_args, render, warning_for, CheckCache,
+        InstallChannel, ATTEMPT_BACKOFF_MAX, ATTEMPT_BACKOFF_MIN,
     };
     use semver::Version;
     use std::ffi::OsString;
@@ -1282,6 +1338,7 @@ mod tests {
         assert_eq!(app_bundle_root(Path::new("/a/Contents/orx")), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn relaunch_target_strips_the_deleted_marker() {
         assert_eq!(

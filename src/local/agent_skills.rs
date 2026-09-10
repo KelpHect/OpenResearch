@@ -431,8 +431,12 @@ mod tests {
                 assert_eq!(lines.next(), Some("---"), "{} missing closing ---", s.name);
                 // A non-empty body follows the closing frontmatter fence
                 // (`\n---\n\n` separates the frontmatter block from the body).
-                let body = s
-                    .content
+                // `include_str!` sees the checkout's native line endings on
+                // Windows, while the repository artifacts are authored with
+                // LF. Normalize only for this structural assertion; the
+                // installed skill content remains byte-for-byte unchanged.
+                let normalized = s.content.replace("\r\n", "\n");
+                let body = normalized
                     .split_once("\n---\n\n")
                     .map(|(_, body)| body)
                     .unwrap_or("");

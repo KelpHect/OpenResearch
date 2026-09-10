@@ -9,7 +9,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-use std::os::unix::{ffi::OsStrExt, process::CommandExt};
+use std::os::unix::ffi::OsStrExt;
 
 use crate::error::{anyhow, Result};
 
@@ -270,11 +270,11 @@ fn git_context_bytes(
     args: &[&str],
 ) -> Result<Vec<u8>> {
     let out = Command::new("git")
-        .current_dir(work_tree)
+        .current_dir(crate::sys::external_path(work_tree))
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_DIR", git_dir)
-        .env("GIT_WORK_TREE", work_tree)
-        .env("GIT_INDEX_FILE", index_file)
+        .env("GIT_DIR", crate::sys::external_path(git_dir))
+        .env("GIT_WORK_TREE", crate::sys::external_path(work_tree))
+        .env("GIT_INDEX_FILE", crate::sys::external_path(index_file))
         .args(args)
         .output()
         .map_err(|error| anyhow!("Could not run git: {error}"))?;
@@ -1514,9 +1514,11 @@ fn authenticated_git_command(repo_path: &Path) -> Command {
         .env("GIT_CONFIG_KEY_1", "credential.helper")
         .env("GIT_CONFIG_VALUE_1", GITHUB_CREDENTIAL_HELPER)
         .env("GIT_CONFIG_KEY_2", "core.hooksPath")
-        .env("GIT_CONFIG_VALUE_2", "/dev/null");
-    #[cfg(unix)]
-    command.process_group(0);
+        .env(
+            "GIT_CONFIG_VALUE_2",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        );
+    crate::sys::new_process_group(&mut command);
     command
 }
 
@@ -1585,7 +1587,10 @@ fn terminate_git_process_tree(child: &mut Child) {
         // Git owns this process group, including credential-bearing transport children.
         libc::kill(-(child.id() as i32), libc::SIGKILL);
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let _ = crate::sys::kill_tree(&child.id().to_string());
+    }
     let _ = child.kill();
 }
 
@@ -1670,8 +1675,7 @@ pub fn spawn_branch_publication(
     if let Some(paths) = super::shell_env::search_path() {
         command.env("PATH", paths);
     }
-    #[cfg(unix)]
-    command.process_group(0);
+    crate::sys::detach(&mut command);
     let mut child = command
         .spawn()
         .map_err(|error| anyhow!("Could not start GitHub publication worker: {error}"))?;

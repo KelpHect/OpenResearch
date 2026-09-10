@@ -149,8 +149,8 @@ fn tex_command(binary: &str) -> Command {
     // biber is never probed — it is chosen from what a pass wrote — so a bare
     // name here is what makes a machine without it fail as ENOENT at spawn.
     let mut command = match find_on_path(binary) {
-        Some(path) => Command::new(path),
-        None => Command::new(binary),
+        Some(path) => crate::sys::command(path),
+        None => crate::sys::command(binary),
     };
     if let Some(paths) = search_path() {
         command.env("PATH", paths);
@@ -353,6 +353,10 @@ fn kill_process_tree(child: &mut std::process::Child) {
             libc::kill(-group, libc::SIGKILL);
         }
     }
+    #[cfg(windows)]
+    {
+        let _ = crate::sys::kill_tree(&child.id().to_string());
+    }
     let _ = child.kill();
 }
 
@@ -387,11 +391,7 @@ fn run_with_timeout(mut command: Command, label: &str, timeout: Duration) -> Res
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
+    crate::sys::new_process_group(&mut command);
     let mut child = command
         .spawn()
         .map_err(|e| anyhow!("could not run {label}: {e}"))?;
@@ -884,7 +884,11 @@ mod tests {
     #[test]
     fn a_tex_tool_is_handed_the_path_its_own_children_need() {
         // `sh` stands in for a TeX tool; all that matters is that it is on PATH.
-        let command = tex_command("sh");
+        #[cfg(not(windows))]
+        let binary = "sh";
+        #[cfg(windows)]
+        let binary = "powershell.exe";
+        let command = tex_command(binary);
         let (_, value) = command
             .get_envs()
             .find(|(key, _)| *key == "PATH")
@@ -989,15 +993,36 @@ mod tests {
         // A hanging engine must not spend the whole budget again on every
         // remaining pass; a document that merely errored must still finish.
         let scratch = ScratchDir::new("timeout").expect("scratch");
+        #[cfg(unix)]
         let script = scratch.0.join("hang.sh");
+        #[cfg(windows)]
+        let script = scratch.0.join("hang.ps1");
+        #[cfg(unix)]
         std::fs::write(&script, "#!/bin/sh\nsleep 30\n").expect("write");
+        #[cfg(windows)]
+        std::fs::write(&script, "Start-Sleep -Seconds 30\n").expect("write");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod");
         }
+        #[cfg(unix)]
         let mut command = Command::new(&script);
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("powershell.exe");
+            command.args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ]);
+            command.arg(&script);
+            command
+        };
         command.current_dir(&scratch.0);
         // Borrow the real runner but with a deadline we can wait out.
         let started = Instant::now();
@@ -1044,6 +1069,7 @@ mod tests {
         assert!(!path.exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_pdf_is_refused_instead_of_followed() {
         let scratch = ScratchDir::new("symlink-case").expect("scratch dir");

@@ -1330,7 +1330,11 @@ fn kill_shell_group(pid: Option<u32>) {
 }
 
 #[cfg(not(unix))]
-fn kill_shell_group(_pid: Option<u32>) {}
+fn kill_shell_group(pid: Option<u32>) {
+    if let Some(pid) = pid {
+        let _ = crate::sys::kill_tree(&pid.to_string());
+    }
+}
 
 /// Drain one stream on its own task from the moment the child starts, so a
 /// chatty command never blocks on a full pipe while we wait for it.
@@ -1363,7 +1367,9 @@ impl ChatHost {
         command: String,
         cwd: PathBuf,
     ) -> Result<WireMessage> {
+        #[cfg(unix)]
         let mut spawn = tokio::process::Command::new("bash");
+        #[cfg(unix)]
         spawn
             .arg("-c")
             .arg(&command)
@@ -1372,14 +1378,40 @@ impl ChatHost {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        #[cfg(unix)]
-        spawn.process_group(0);
+        #[cfg(windows)]
+        let mut spawn = tokio::process::Command::new("powershell.exe");
+        #[cfg(windows)]
+        spawn
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+            ])
+            .arg(&command)
+            .current_dir(&cwd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        crate::sys::new_process_group_tokio(&mut spawn);
         prepare_env(&mut spawn);
         let mut exit_code = None;
-        let mut signal = None;
+        #[cfg(unix)]
+        let mut signal: Option<i64> = None;
+        #[cfg(not(unix))]
+        let signal: Option<i64> = None;
         let mut timed_out = false;
         let (mut output, mut error) = match spawn.spawn() {
-            Err(error) => (String::new(), format!("could not start bash: {error}")),
+            Err(error) => (
+                String::new(),
+                format!(
+                    "could not start {}: {error}",
+                    if cfg!(windows) { "PowerShell" } else { "bash" }
+                ),
+            ),
             Ok(mut child) => {
                 let pid = child.id();
                 let stdout = drain_shell_stream(child.stdout.take());
@@ -7582,12 +7614,13 @@ pub async fn watch_runs(
 /// [`PATH_GUARD`] is what holds it once the child's shell reads a user profile.
 pub fn prepare_env(cmd: &mut tokio::process::Command) {
     if let Some(dir) = orx_bin_dir() {
-        let mut path = dir.into_os_string();
+        let mut paths = vec![dir];
         if let Some(existing) = crate::local::shell_env::search_path().filter(|p| !p.is_empty()) {
-            path.push(":");
-            path.push(existing);
+            paths.extend(std::env::split_paths(&existing));
         }
-        cmd.env("PATH", path);
+        if let Ok(path) = std::env::join_paths(paths) {
+            cmd.env("PATH", path);
+        }
     }
     // So an agent's `orx exp run` resolves the same store the dashboard is
     // showing it, rather than re-resolving to the default.
@@ -7641,6 +7674,7 @@ const BIN_DIR_ENV: &str = "ORX_BIN_DIR";
 /// non-interactive bash sources a file this rides on; an interactive bash
 /// ignores `BASH_ENV`. A harness that snapshots the user's shell inherits the
 /// guarded order, because capturing the snapshot runs these same files.
+#[cfg(not(windows))]
 const PATH_GUARD: &str =
     "if [ -n \"${ORX_BIN_DIR-}\" ] && [ \"${PATH%%:*}\" != \"$ORX_BIN_DIR\" ]; then\n\
      export PATH=\"$ORX_BIN_DIR${PATH:+:$PATH}\"\n\
@@ -7655,14 +7689,23 @@ fn orx_bin_dir() -> Option<PathBuf> {
     // the un-canonicalized path still names the right directory.
     let exe = exe.canonicalize().unwrap_or(exe);
     exe.parent()
-        .filter(|dir| dir.is_absolute() && !dir.to_string_lossy().contains(':'))
+        .filter(|dir| {
+            dir.is_absolute()
+                && if cfg!(unix) {
+                    !dir.to_string_lossy().contains(':')
+                } else {
+                    true
+                }
+        })
         .map(std::path::Path::to_path_buf)
 }
 
+#[cfg(not(windows))]
 fn shell_single_quote(path: &std::path::Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
+#[cfg(not(windows))]
 fn zsh_startup_wrapper(name: &str) -> String {
     format!(
         "_ORX_CHAT_SHIM_ZDOTDIR=$ZDOTDIR\n\
@@ -7673,6 +7716,7 @@ fn zsh_startup_wrapper(name: &str) -> String {
     ) + PATH_GUARD
 }
 
+#[cfg(not(windows))]
 fn zshenv_hook(original_zdotdir: &std::path::Path) -> String {
     format!(
         "_ORX_CHAT_SHIM_ZDOTDIR=$ZDOTDIR\n\
@@ -7692,6 +7736,7 @@ fn zshenv_hook(original_zdotdir: &std::path::Path) -> String {
     ) + PATH_GUARD
 }
 
+#[cfg(not(windows))]
 fn bash_env_hook(original: Option<String>) -> String {
     let source = original
         .map(|value| {
@@ -7715,6 +7760,7 @@ fn bash_env_hook(original: Option<String>) -> String {
     ) + PATH_GUARD
 }
 
+#[cfg(not(windows))]
 fn child_env_value(key: &str) -> Option<std::ffi::OsString> {
     std::env::var_os(key).or_else(|| {
         crate::config::list_synced_env()
@@ -7764,42 +7810,45 @@ pub fn set_chat_session_env(
     cmd.env_remove(CHAT_TARGET_FILE_ENV);
     cmd.env_remove(CHAT_TARGET_POINTER_ENV);
 
-    let shell_dir = shell_hook_dir(session_id);
-    if std::fs::create_dir_all(&shell_dir).is_err() {
-        return;
-    }
-    let original_zdotdir = child_env_value("ZDOTDIR")
-        .map(PathBuf::from)
-        .or_else(|| child_env_value("HOME").map(PathBuf::from));
-    let Some(original_zdotdir) = original_zdotdir else {
-        return;
-    };
-    let pointer = target_event_pointer(session_id);
-    let zshenv = zshenv_hook(&original_zdotdir);
-    let mut hooks = vec![(".zshenv", zshenv)];
-    hooks.extend(
-        [".zprofile", ".zshrc", ".zlogin", ".zlogout"]
-            .into_iter()
-            .map(|name| (name, zsh_startup_wrapper(name))),
-    );
-    if hooks
-        .iter()
-        .any(|(name, contents)| std::fs::write(shell_dir.join(name), contents).is_err())
+    #[cfg(not(windows))]
     {
-        return;
-    }
+        let shell_dir = shell_hook_dir(session_id);
+        if std::fs::create_dir_all(&shell_dir).is_err() {
+            return;
+        }
+        let original_zdotdir = child_env_value("ZDOTDIR")
+            .map(PathBuf::from)
+            .or_else(|| child_env_value("HOME").map(PathBuf::from));
+        let Some(original_zdotdir) = original_zdotdir else {
+            return;
+        };
+        let pointer = target_event_pointer(session_id);
+        let zshenv = zshenv_hook(&original_zdotdir);
+        let mut hooks = vec![(".zshenv", zshenv)];
+        hooks.extend(
+            [".zprofile", ".zshrc", ".zlogin", ".zlogout"]
+                .into_iter()
+                .map(|name| (name, zsh_startup_wrapper(name))),
+        );
+        if hooks
+            .iter()
+            .any(|(name, contents)| std::fs::write(shell_dir.join(name), contents).is_err())
+        {
+            return;
+        }
 
-    let bash_env = shell_dir.join("bash_env");
-    let original_bash_env =
-        child_env_value("BASH_ENV").map(|value| value.to_string_lossy().into_owned());
-    let bash_hook = bash_env_hook(original_bash_env);
-    if std::fs::write(&bash_env, bash_hook).is_err() {
-        return;
-    }
+        let bash_env = shell_dir.join("bash_env");
+        let original_bash_env =
+            child_env_value("BASH_ENV").map(|value| value.to_string_lossy().into_owned());
+        let bash_hook = bash_env_hook(original_bash_env);
+        if std::fs::write(&bash_env, bash_hook).is_err() {
+            return;
+        }
 
-    cmd.env(CHAT_TARGET_POINTER_ENV, pointer);
-    cmd.env("ZDOTDIR", shell_dir);
-    cmd.env("BASH_ENV", bash_env);
+        cmd.env(CHAT_TARGET_POINTER_ENV, pointer);
+        cmd.env("ZDOTDIR", shell_dir);
+        cmd.env("BASH_ENV", bash_env);
+    }
 }
 
 /// The chat session that launched this run, read from the env the harness child
@@ -7944,6 +7993,7 @@ mod cap_tests {
         assert!(!safe_session_name("...").is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn shell_hooks_tolerate_nounset_and_preserve_spaced_bash_env() {
         let root = std::env::temp_dir().join(format!("orx-shell-hook-{}", uuid::Uuid::new_v4()));
@@ -7980,6 +8030,7 @@ mod cap_tests {
         assert!(zshenv_hook(std::path::Path::new("/tmp")).contains("${ZSH_EXECUTION_STRING-}"));
     }
 
+    #[cfg(unix)]
     fn write_orx_stub(dir: &std::path::Path, marker: &str) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(dir).unwrap();
@@ -7990,6 +8041,7 @@ mod cap_tests {
 
     /// A stale `orx` on a directory a user startup file prepends, ahead of the
     /// one `prepare_env` fronted.
+    #[cfg(unix)]
     fn path_guard_fixture(root: &std::path::Path) -> (PathBuf, String, String) {
         let ours = root.join("ours");
         let decoy = root.join("decoy");
@@ -8022,6 +8074,7 @@ mod cap_tests {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
+    #[cfg(unix)]
     #[test]
     fn path_guard_refronts_orx_after_a_bash_hook_prepends_its_own_bin() {
         let root = std::env::temp_dir().join(format!("orx-path-guard-{}", uuid::Uuid::new_v4()));
@@ -8055,6 +8108,7 @@ mod cap_tests {
         assert_eq!(unguarded, "decoy", "the user hook's prepend never ran");
     }
 
+    #[cfg(unix)]
     #[test]
     fn path_guard_refronts_orx_after_a_zsh_startup_file_prepends_its_own_bin() {
         if !std::process::Command::new("zsh")

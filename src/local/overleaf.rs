@@ -1893,7 +1893,11 @@ mod tests {
     #[test]
     fn the_upload_page_posts_every_file_as_a_data_url() {
         let temporary = TemporaryDirectory::new("orx-overleaf-test").unwrap();
-        let tex = temporary.path().join("pa\"per.tex");
+        #[cfg(not(windows))]
+        let filename = "pa\"per.tex";
+        #[cfg(windows)]
+        let filename = "paper.tex";
+        let tex = temporary.path().join(filename);
         std::fs::write(&tex, b"% !TeX program = lualatex\nhi").unwrap();
         let payload = collect(&tex).unwrap();
 
@@ -1901,8 +1905,13 @@ mod tests {
         assert!(html.contains("action=\"https://www.overleaf.com/docs\""));
         assert!(html.contains("data:text/plain;base64,"));
         assert!(html.contains("name=\"engine\" value=\"lualatex\""));
-        // A quote in a file name must not break out of the attribute.
-        assert!(html.contains("pa&quot;per.tex"));
-        assert!(!html.contains("value=\"pa\"per.tex\""));
+        #[cfg(not(windows))]
+        {
+            // A quote in a file name must not break out of the attribute.
+            assert!(html.contains("pa&quot;per.tex"));
+            assert!(!html.contains("value=\"pa\"per.tex\""));
+        }
+        #[cfg(windows)]
+        assert!(html.contains("paper.tex"));
     }
 }

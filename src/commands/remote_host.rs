@@ -10,7 +10,12 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::io::{
+    AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, BufReader,
+};
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 
@@ -18,6 +23,15 @@ use crate::error::{anyhow, Result};
 use crate::local::chat::ChatHost;
 use crate::store::Store;
 use crate::{RemoteHostArgs, RemoteHostCommand};
+
+/// The remote-host control channel is a Unix domain socket on Unix and a
+/// same-machine Windows named pipe on Windows.  Keeping the transport local
+/// means status/stop cannot be reached over the dashboard's HTTP port.
+trait ControlIo: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> ControlIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+type ControlStream = Box<dyn ControlIo>;
 
 pub(crate) const CONTROL_PROTOCOL: u32 = 1;
 pub(crate) const HOST_MARKER: &str = "ORX_REMOTE_HOST=";
@@ -241,7 +255,10 @@ impl ControlServer {
         } = self;
         task.abort();
         let _ = task.await;
+        #[cfg(unix)]
         let _ = std::fs::remove_file(socket_path);
+        #[cfg(windows)]
+        let _ = socket_path;
         if read_descriptor(&descriptor_path)
             .is_some_and(|descriptor| descriptor.instance_id == instance_id)
         {
@@ -259,6 +276,7 @@ pub(crate) async fn start_control_server(
 ) -> Result<ControlServer> {
     let data_dir = canonical_data_dir()?;
     let socket_path = control_socket_path(&data_dir)?;
+    #[cfg(unix)]
     if socket_path.exists() {
         let metadata = std::fs::symlink_metadata(&socket_path)?;
         if metadata.file_type().is_symlink() || metadata_uid(&metadata) != effective_uid() {
@@ -268,14 +286,31 @@ pub(crate) async fn start_control_server(
         }
         std::fs::remove_file(&socket_path)?;
     }
+    #[cfg(unix)]
     let listener = UnixListener::bind(&socket_path)?;
+    #[cfg(windows)]
+    let mut listener = {
+        let name = socket_path
+            .to_str()
+            .ok_or_else(|| anyhow!("Invalid Windows control-pipe name."))?;
+        ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(name)?
+    };
+    #[cfg(unix)]
     set_mode(&socket_path, 0o600)?;
     let descriptor_path = descriptor_path(&data_dir)?;
     write_descriptor(&descriptor_path, &descriptor)?;
     let instance_id = descriptor.instance_id.clone();
     let task_descriptor = descriptor.clone();
+    #[cfg(windows)]
+    let control_pipe_name = socket_path
+        .to_str()
+        .ok_or_else(|| anyhow!("Invalid Windows control-pipe name."))?
+        .to_owned();
     let control_gate = Arc::new(tokio::sync::Mutex::new(()));
     let task = tokio::spawn(async move {
+        #[cfg(unix)]
         loop {
             let (stream, _) = match listener.accept().await {
                 Ok(connection) => connection,
@@ -298,9 +333,47 @@ pub(crate) async fn start_control_server(
             let stop = stop.clone();
             let control_gate = control_gate.clone();
             tokio::spawn(async move {
-                let _ =
-                    handle_control(stream, descriptor, auth, chat, stopping, stop, control_gate)
-                        .await;
+                let _ = handle_control(
+                    Box::new(stream),
+                    descriptor,
+                    auth,
+                    chat,
+                    stopping,
+                    stop,
+                    control_gate,
+                )
+                .await;
+            });
+        }
+        #[cfg(windows)]
+        loop {
+            if listener.connect().await.is_err() {
+                break;
+            }
+            let connected = listener;
+            let next = match ServerOptions::new().create(&control_pipe_name) {
+                Ok(next) => next,
+                Err(_) => break,
+            };
+            listener = next;
+
+            let descriptor = task_descriptor.clone();
+            let auth = auth.clone();
+            let chat = chat.clone();
+            let stopping = stopping.clone();
+            let stop = stop.clone();
+            let control_gate = control_gate.clone();
+            tokio::spawn(async move {
+                let _ = handle_control(
+                    Box::new(connected),
+                    descriptor,
+                    auth,
+                    chat,
+                    stopping,
+                    stop,
+                    control_gate,
+                )
+                .await;
             });
         }
     });
@@ -313,7 +386,7 @@ pub(crate) async fn start_control_server(
 }
 
 async fn handle_control(
-    stream: UnixStream,
+    stream: ControlStream,
     descriptor: HostDescriptor,
     auth: RemoteAuth,
     chat: Arc<ChatHost>,
@@ -533,7 +606,7 @@ async fn attach(expected_instance: &str) -> Result<()> {
         .map_err(|_| anyhow!("Timed out waiting for the remote attachment credential."))??;
     validate_token(&token)?;
     let data_dir = canonical_data_dir()?;
-    let mut stream = UnixStream::connect(control_socket_path(&data_dir)?).await?;
+    let mut stream = connect_control(&control_socket_path(&data_dir)?).await?;
     write_request(
         &mut stream,
         &ControlRequest::Attach {
@@ -628,9 +701,22 @@ async fn wait_for_server_lock_free(data_dir: &Path) -> Result<()> {
     .map_err(|_| anyhow!("Timed out waiting for the previous OpenResearch host to stop."))?
 }
 
+#[cfg(unix)]
+async fn connect_control(path: &Path) -> Result<ControlStream> {
+    Ok(Box::new(UnixStream::connect(path).await?))
+}
+
+#[cfg(windows)]
+async fn connect_control(path: &Path) -> Result<ControlStream> {
+    let name = path
+        .to_str()
+        .ok_or_else(|| anyhow!("Invalid Windows control-pipe name."))?;
+    Ok(Box::new(ClientOptions::new().open(name)?))
+}
+
 async fn control_exchange(data_dir: &Path, request: &ControlRequest) -> Result<ControlResponse> {
     tokio::time::timeout(CONTROL_TIMEOUT, async {
-        let mut stream = UnixStream::connect(control_socket_path(data_dir)?).await?;
+        let mut stream = connect_control(&control_socket_path(data_dir)?).await?;
         write_request(&mut stream, request).await?;
         let mut reader = BufReader::new(stream);
         let line = read_bounded_line(&mut reader).await?;
@@ -640,7 +726,10 @@ async fn control_exchange(data_dir: &Path, request: &ControlRequest) -> Result<C
     .map_err(|_| anyhow!("Timed out contacting the persistent OpenResearch host."))?
 }
 
-async fn write_request(stream: &mut UnixStream, request: &ControlRequest) -> Result<()> {
+async fn write_request<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    request: &ControlRequest,
+) -> Result<()> {
     stream
         .write_all(serde_json::to_string(request)?.as_bytes())
         .await?;
@@ -649,7 +738,10 @@ async fn write_request(stream: &mut UnixStream, request: &ControlRequest) -> Res
     Ok(())
 }
 
-async fn write_response(stream: &mut UnixStream, response: &ControlResponse) -> Result<()> {
+async fn write_response<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    response: &ControlResponse,
+) -> Result<()> {
     stream
         .write_all(serde_json::to_string(response)?.as_bytes())
         .await?;
@@ -706,6 +798,8 @@ fn spawn_detached_host(data_dir: &Path) -> Result<(std::process::Child, PathBuf)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log));
+    #[cfg(windows)]
+    crate::sys::detach(&mut command);
     #[cfg(unix)]
     unsafe {
         use std::os::unix::process::CommandExt as _;
@@ -717,10 +811,20 @@ fn spawn_detached_host(data_dir: &Path) -> Result<(std::process::Child, PathBuf)
             }
         });
     }
-    if let Ok(child) = command.spawn() {
-        return Ok((child, log_path));
-    }
+    let spawn_error = match command.spawn() {
+        Ok(child) => return Ok((child, log_path)),
+        Err(error) => error,
+    };
+    #[cfg(not(unix))]
+    return Err(anyhow!(
+        "Could not start the persistent OpenResearch host: {spawn_error}"
+    ));
+
+    #[cfg(unix)]
+    let _ = spawn_error;
+    #[cfg(unix)]
     let log = open_runtime_log(&log_path)?;
+    #[cfg(unix)]
     let child = std::process::Command::new("nohup")
         .arg(&executable)
         .args(args)
@@ -729,6 +833,7 @@ fn spawn_detached_host(data_dir: &Path) -> Result<(std::process::Child, PathBuf)
         .stderr(Stdio::from(log))
         .spawn()
         .map_err(|error| anyhow!("Could not start the persistent OpenResearch host: {error}"))?;
+    #[cfg(unix)]
     Ok((child, log_path))
 }
 
@@ -816,11 +921,31 @@ fn descriptor_path(data_dir: &Path) -> Result<PathBuf> {
 }
 
 fn control_socket_path(data_dir: &Path) -> Result<PathBuf> {
-    runtime_path(data_dir, "sock")
+    #[cfg(unix)]
+    {
+        runtime_path(data_dir, "sock")
+    }
+    #[cfg(windows)]
+    {
+        let lock_key = normalize_lock_key(data_dir)?;
+        let hash = Sha256::digest(lock_key.as_os_str().as_encoded_bytes());
+        let name = hash
+            .iter()
+            .take(16)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        Ok(PathBuf::from(format!(
+            r"\\.\pipe\orx-remote-{}-{name}",
+            effective_uid()
+        )))
+    }
 }
 
 fn runtime_path(data_dir: &Path, extension: &str) -> Result<PathBuf> {
+    #[cfg(unix)]
     let root = PathBuf::from(format!("/tmp/orx-{}", effective_uid()));
+    #[cfg(windows)]
+    let root = std::env::temp_dir().join(format!("orx-{}", effective_uid()));
     ensure_private_dir(&root)?;
     let lock_key = normalize_lock_key(data_dir)?;
     let hash = Sha256::digest(lock_key.as_os_str().as_encoded_bytes());
@@ -866,8 +991,15 @@ fn directory_writable(path: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
-fn directory_writable(_path: &Path) -> bool {
-    true
+fn directory_writable(path: &Path) -> bool {
+    let probe = path.join(format!(".orx-write-probe-{}", uuid::Uuid::new_v4()));
+    match OpenOptions::new().write(true).create_new(true).open(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(probe);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 fn normalize_lock_key(path: &Path) -> Result<PathBuf> {
@@ -929,6 +1061,20 @@ fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+#[cfg(not(unix))]
+fn effective_uid() -> u32 {
+    // Windows has no uid. A stable hash of the interactive account keeps
+    // runtime paths and pipe names separate when several users share a host.
+    let identity = std::env::var("USERDOMAIN")
+        .ok()
+        .zip(std::env::var("USERNAME").ok())
+        .map(|(domain, user)| format!("{domain}\\{user}"))
+        .or_else(|| std::env::var("USERNAME").ok())
+        .unwrap_or_else(|| "unknown-user".into());
+    let digest = Sha256::digest(identity.as_bytes());
+    u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]])
+}
+
 #[cfg(unix)]
 fn metadata_uid(metadata: &std::fs::Metadata) -> u32 {
     use std::os::unix::fs::MetadataExt as _;
@@ -945,6 +1091,24 @@ fn metadata_mode(metadata: &std::fs::Metadata) -> u32 {
 fn set_mode(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn metadata_uid(_metadata: &std::fs::Metadata) -> u32 {
+    effective_uid()
+}
+
+#[cfg(not(unix))]
+fn metadata_mode(_metadata: &std::fs::Metadata) -> u32 {
+    // Windows security is provided by the inherited user DACL rather than
+    // POSIX mode bits. The runtime directory is created below the user's temp
+    // directory and named pipes reject remote clients.
+    0
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
 }
 
@@ -972,9 +1136,15 @@ mod tests {
             shared_path(&data_dir, "lock").unwrap().parent(),
             Some(parent.as_path())
         );
+        #[cfg(unix)]
         assert!(control_socket_path(&data_dir)
             .unwrap()
             .starts_with(format!("/tmp/orx-{}", effective_uid())));
+        #[cfg(windows)]
+        assert!(control_socket_path(&data_dir)
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(r"\\.\pipe\orx-remote-"));
     }
 
     #[test]

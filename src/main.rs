@@ -28,6 +28,7 @@ mod output;
 mod plane;
 mod remote;
 mod store;
+mod sys;
 mod telemetry;
 mod updates;
 mod workspace_state;

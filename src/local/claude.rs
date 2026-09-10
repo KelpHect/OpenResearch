@@ -39,7 +39,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+#[cfg(unix)]
+use tokio::process::Command;
+use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 
 use crate::error::{anyhow, Result};
@@ -459,7 +461,7 @@ async fn spawn_client(spec: &SpawnSpec, auth_generation: u64) -> Result<Arc<Clau
     let bin = find_claude().ok_or_else(|| {
         anyhow!("claude not found on PATH — install Claude Code and run `claude` once to sign in")
     })?;
-    let mut cmd = Command::new(&bin);
+    let mut cmd = crate::sys::tokio_command(&bin);
     cmd.args([
         "--print",
         "--input-format",
@@ -569,8 +571,7 @@ async fn spawn_client(spec: &SpawnSpec, auth_generation: u64) -> Result<Arc<Clau
     // Own process group: a terminal SIGINT reaches orx up alone, which then
     // tears the resident child down deliberately (kill_session / shutdown). A
     // shared group would let Ctrl-C kill a persistent child mid-turn.
-    #[cfg(unix)]
-    cmd.process_group(0);
+    crate::sys::new_process_group_tokio(&mut cmd);
 
     let mut child = cmd
         .spawn()

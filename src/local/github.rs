@@ -2,10 +2,8 @@
 
 use std::time::Duration;
 
-use serde_json::Value;
-use tokio::process::Command;
-
 use crate::error::{anyhow, Result};
+use serde_json::Value;
 
 const UA: &str = concat!("orx/", env!("CARGO_PKG_VERSION"));
 pub const SHALLOW_CLONE_THRESHOLD_KB: u64 = 250 * 1024;
@@ -37,8 +35,8 @@ pub async fn status() -> Status {
 
 async fn gh(args: &[&str], timeout: Duration) -> Result<String> {
     let mut command = match super::shell_env::find_on_path("gh") {
-        Some(path) => Command::new(path),
-        None => Command::new("gh"),
+        Some(path) => crate::sys::tokio_command(path),
+        None => crate::sys::tokio_command("gh"),
     };
     command
         .args(args)

@@ -40,9 +40,19 @@ pub fn opencode_db(store: NativeStore) -> PathBuf {
     match store {
         NativeStore::Isolated => crate::store::data_dir().join("agents/opencode/opencode.db"),
         NativeStore::Legacy => user_env_path("OPENCODE_DB").unwrap_or_else(|| {
-            user_env_path("XDG_DATA_HOME")
-                .unwrap_or_else(|| home_dir().join(".local/share"))
-                .join("opencode/opencode.db")
+            #[cfg(windows)]
+            {
+                user_env_path("XDG_DATA_HOME")
+                    .or_else(dirs::data_local_dir)
+                    .unwrap_or_else(|| home_dir().join("AppData/Local"))
+                    .join("opencode/opencode.db")
+            }
+            #[cfg(not(windows))]
+            {
+                user_env_path("XDG_DATA_HOME")
+                    .unwrap_or_else(|| home_dir().join(".local/share"))
+                    .join("opencode/opencode.db")
+            }
         }),
     }
 }
@@ -421,6 +431,7 @@ fn create_symlink(source: &Path, destination: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::*;
 
     #[cfg(unix)]

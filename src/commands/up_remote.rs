@@ -11,7 +11,6 @@
 //! `~/.ssh/config` + agent/keys — orx never reads a key.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -1771,37 +1770,40 @@ fn parse_remote_install_paths(output: &str) -> Option<RemoteInstallPaths> {
     })
 }
 
-fn storage_root(path: &str, filename: &str, label: &str) -> Result<PathBuf> {
-    let path = Path::new(path);
-    if !path.is_absolute()
-        || path.components().any(|part| {
-            matches!(
-                part,
-                std::path::Component::CurDir | std::path::Component::ParentDir
-            )
-        })
+/// Parent of a validated POSIX path supplied by the SSH host. These are remote
+/// paths, not local Windows paths, so using `Path` here would reject `/home/...`
+/// on Windows or rewrite it with backslashes in a shell command.
+fn remote_parent(path: &str, label: &str) -> Result<String> {
+    if !path.starts_with('/')
+        || path
+            .split('/')
+            .any(|component| matches!(component, "." | ".."))
     {
         return Err(anyhow!("{label} must be an absolute path without . or .."));
     }
-    if path.file_name().and_then(|name| name.to_str()) != Some(filename) {
-        return Err(anyhow!("{label} must end in /{filename}"));
+    let index = path
+        .rfind('/')
+        .ok_or_else(|| anyhow!("{label} has no parent directory"))?;
+    if index == 0 {
+        Ok("/".into())
+    } else {
+        Ok(path[..index].to_string())
     }
-    path.parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .ok_or_else(|| anyhow!("{label} has no parent directory"))
 }
 
-fn validated_roots(paths: &RemoteInstallPaths) -> Result<(PathBuf, PathBuf, PathBuf)> {
+fn storage_root(path: &str, filename: &str, label: &str) -> Result<String> {
+    if path.rsplit('/').next() != Some(filename) {
+        return Err(anyhow!("{label} must end in /{filename}"));
+    }
+    remote_parent(path, label)
+}
+
+fn validated_roots(paths: &RemoteInstallPaths) -> Result<(String, String, String)> {
     let bin = storage_root(&paths.binary, "orx", "OpenResearch binary")?;
-    if bin.file_name().and_then(|name| name.to_str()) != Some("bin") {
+    if bin.rsplit('/').next() != Some("bin") {
         return Err(anyhow!("OpenResearch binary must end in /bin/orx"));
     }
-    let cargo = bin
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .ok_or_else(|| anyhow!("OpenResearch binary has no install directory"))?;
+    let cargo = remote_parent(&bin, "OpenResearch binary")?;
     let data = storage_root(&paths.database, "orx.db", "Database")?;
     let cache = storage_root(&paths.cache, "repos", "Repository cache")?;
     Ok((cargo, data, cache))
@@ -1835,10 +1837,7 @@ async fn write_remote_json(
 ) -> Result<()> {
     let body = format!("{}\n", serde_json::to_string_pretty(value)?);
     let quoted_path = crate::jobs::ssh::sh_quote(path);
-    let parent = Path::new(path)
-        .parent()
-        .ok_or_else(|| anyhow!("Remote settings path has no parent directory"))?;
-    let parent = crate::jobs::ssh::sh_quote(&parent.to_string_lossy());
+    let parent = crate::jobs::ssh::sh_quote(&remote_parent(path, "Remote settings path")?);
     let command = remote_orx_cmd(&format!(
         "mkdir -p {parent} && umask 077 && tmp={quoted_path}.tmp.$$ && \
          trap 'rm -f \"$tmp\"' EXIT && cat > \"$tmp\" && chmod 600 \"$tmp\" && \
@@ -1861,11 +1860,8 @@ pub(crate) async fn save_remote_install_paths(
         .as_object_mut()
         .ok_or_else(|| anyhow!("OpenResearch settings on '{host}' are invalid."))?;
     object.insert("orxBinaryPath".into(), paths.binary.clone().into());
-    object.insert("dataDir".into(), data.to_string_lossy().into_owned().into());
-    object.insert(
-        "cacheDir".into(),
-        cache.to_string_lossy().into_owned().into(),
-    );
+    object.insert("dataDir".into(), data.into());
+    object.insert("cacheDir".into(), cache.into());
     write_remote_json(target, host, &paths.settings, &settings).await
 }
 
@@ -1898,27 +1894,28 @@ pub(crate) async fn remote_install_paths(
         .get("orxBinaryPath")
         .and_then(|value| value.as_str())
     {
-        if Path::new(binary).is_absolute() {
+        if remote_is_absolute(binary) {
             paths.binary = binary.to_string();
         }
     }
     if let Some(data) = settings.get("dataDir").and_then(|value| value.as_str()) {
-        if Path::new(data).is_absolute() {
-            paths.database = Path::new(data)
-                .join("orx.db")
-                .to_string_lossy()
-                .into_owned();
+        if remote_is_absolute(data) {
+            paths.database = format!("{}/orx.db", data.trim_end_matches('/'));
         }
     }
     if let Some(cache) = settings.get("cacheDir").and_then(|value| value.as_str()) {
-        if Path::new(cache).is_absolute() {
-            paths.cache = Path::new(cache)
-                .join("repos")
-                .to_string_lossy()
-                .into_owned();
+        if remote_is_absolute(cache) {
+            paths.cache = format!("{}/repos", cache.trim_end_matches('/'));
         }
     }
     Ok(paths)
+}
+
+fn remote_is_absolute(path: &str) -> bool {
+    path.starts_with('/')
+        && !path
+            .split('/')
+            .any(|component| matches!(component, "." | ".."))
 }
 
 /// Resolve the authenticated remote user's existing binary once, then launch
@@ -1973,7 +1970,7 @@ pub(crate) async fn install_remote_orx(
     paths: &RemoteInstallPaths,
 ) -> Result<RemoteOrx> {
     let (cargo, _, _) = validated_roots(paths)?;
-    let cargo = crate::jobs::ssh::sh_quote(&cargo.to_string_lossy());
+    let cargo = crate::jobs::ssh::sh_quote(&cargo);
     let version = env!("CARGO_PKG_VERSION");
     let installer = remote_installer(version);
     let command = remote_login_orx_cmd(&format!("export CARGO_HOME={cargo}; {installer}"));
@@ -2093,8 +2090,8 @@ fn remote_host_cmd(path: &str, paths: &RemoteInstallPaths, operation: &str) -> R
     let (_, data, cache) = validated_roots(paths)?;
     Ok(remote_orx_cmd(&format!(
         "export ORX_DATA_DIR={} ORX_CACHE_DIR={}; exec {} remote-host {operation}",
-        crate::jobs::ssh::sh_quote(&data.to_string_lossy()),
-        crate::jobs::ssh::sh_quote(&cache.to_string_lossy()),
+        crate::jobs::ssh::sh_quote(&data),
+        crate::jobs::ssh::sh_quote(&cache),
         crate::jobs::ssh::sh_quote(path),
     )))
 }

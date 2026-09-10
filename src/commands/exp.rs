@@ -154,11 +154,7 @@ pub(crate) fn spawn_detached_supervise(run_id: &str) -> Result<()> {
     crate::local::shell_env::export_to(|key, value| {
         cmd.env(key, value);
     });
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
+    crate::sys::detach(&mut cmd);
     cmd.spawn()
         .map_err(|e| anyhow!("Could not spawn `orx supervise {}`: {}", run_id, e))?;
     Ok(())

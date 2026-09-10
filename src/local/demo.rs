@@ -214,7 +214,7 @@ fn repair_installed_origin_at(data_root: &Path, repo: &Path) -> Result<()> {
     if !repo.join(".git").is_dir() {
         return Ok(());
     }
-    let bare = data_root.join("demo-repos/nanochat.git");
+    let bare = data_root.join("demo-repos").join("nanochat.git");
     if !matches!(
         git(&bare, &["rev-parse", "--is-bare-repository"]).as_deref(),
         Ok("true")
@@ -1239,15 +1239,35 @@ fn build_worktree(root: &Path) -> Result<()> {
     git(root, &["-c", "init.defaultObjectFormat=sha1", "init"])?;
     git(root, &["symbolic-ref", "HEAD", "refs/heads/main"])?;
     git(root, &["config", "core.autocrlf", "false"])?;
-    git(root, &["config", "core.filemode", "true"])?;
+    // The executable bit is part of the portable Git commit, but NTFS does
+    // not expose it as a worktree mode. Keep the bit in the index while
+    // preventing Windows Git from reporting every checked-out shell asset as
+    // locally modified.
+    git(
+        root,
+        &[
+            "config",
+            "core.filemode",
+            if cfg!(windows) { "false" } else { "true" },
+        ],
+    )?;
     git(root, &["add", "-A"])?;
+    #[cfg(windows)]
+    git(root, &["update-index", "--chmod=+x", "runs/runcpu.sh"])?;
     commit(root, "Import nanochat demo baseline")?;
     git(root, &["checkout", "-b", BRANCH])?;
     write_assets::<ExperimentAssets>(root)?;
     set_executable(root.join("runs/runcpu.sh"))?;
     git(root, &["add", "-A"])?;
+    #[cfg(windows)]
+    git(root, &["update-index", "--chmod=+x", "runs/runcpu.sh"])?;
     commit(root, "Make the CPU pipeline portable and memory-safe")?;
-    git(root, &["checkout", "main"])?;
+    // This is a freshly-created demo worktree with no user edits. Windows Git
+    // can retain an execute-bit/stat difference for a shell asset even after
+    // the commit (the bit is represented in the index, not by NTFS). Force the
+    // final checkout so that platform-specific file metadata cannot block
+    // seeding the known-good baseline branch.
+    git(root, &["checkout", "--force", "main"])?;
     Ok(())
 }
 
@@ -1358,12 +1378,21 @@ fn write_assets<T: RustEmbed>(root: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, asset.data.as_ref())?;
+        // Git stores repository text with LF. A Windows checkout commonly
+        // presents those files to RustEmbed as CRLF, but seeding the same demo
+        // must produce the same commits on every host. Binary assets are not
+        // valid UTF-8, so they pass through byte-for-byte.
+        let bytes = match String::from_utf8(asset.data.to_vec()) {
+            Ok(text) => text.replace("\r\n", "\n").into_bytes(),
+            Err(_) => asset.data.to_vec(),
+        };
+        std::fs::write(path, bytes)?;
     }
     Ok(())
 }
 
 fn commit(repo: &Path, message: &str) -> Result<()> {
+    let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
     git(
         repo,
         &[
@@ -1374,7 +1403,7 @@ fn commit(repo: &Path, message: &str) -> Result<()> {
             "-c",
             "commit.gpgsign=false",
             "-c",
-            "core.hooksPath=/dev/null",
+            &format!("core.hooksPath={null_device}"),
             "commit",
             "-m",
             message,
@@ -1385,6 +1414,7 @@ fn commit(repo: &Path, message: &str) -> Result<()> {
 
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let mut command = Command::new("git");
+    let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
     for name in [
         "GIT_DIR",
         "GIT_WORK_TREE",
@@ -1404,16 +1434,16 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
         .current_dir(dir)
         .args([
             "-c",
-            "core.attributesFile=/dev/null",
+            &format!("core.attributesFile={null_device}"),
             "-c",
-            "core.excludesFile=/dev/null",
+            &format!("core.excludesFile={null_device}"),
             "-c",
-            "core.hooksPath=/dev/null",
+            &format!("core.hooksPath={null_device}"),
         ])
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_GLOBAL", null_device)
         .env("GIT_ATTR_NOSYSTEM", "1")
         .env("GIT_AUTHOR_NAME", "OpenResearch Demo")
         .env("GIT_AUTHOR_EMAIL", "demo@openresearch.sh")
@@ -1433,13 +1463,13 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn set_executable(path: PathBuf) -> Result<()> {
+fn set_executable(_path: PathBuf) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(&path)?.permissions();
+        let mut permissions = std::fs::metadata(&_path)?.permissions();
         permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions)?;
+        std::fs::set_permissions(_path, permissions)?;
     }
     Ok(())
 }
@@ -1693,7 +1723,7 @@ mod tests {
             .parts_json
             .contains(data.to_string_lossy().as_ref()));
         assert!(repo.join(".git").is_dir());
-        let bare = data.join("demo-repos/nanochat.git");
+        let bare = data.join("demo-repos").join("nanochat.git");
         assert!(bare.join("HEAD").is_file());
         assert_eq!(
             git(&bare, &["symbolic-ref", "HEAD"]).unwrap(),
@@ -1701,7 +1731,7 @@ mod tests {
         );
         assert_eq!(
             git(&repo, &["remote", "get-url", "origin"]).unwrap(),
-            bare.to_string_lossy()
+            crate::sys::external_path(&bare).to_string_lossy()
         );
         let changed = git(&repo, &["diff", "--name-only", "main", BRANCH]).unwrap();
         assert_eq!(
@@ -1851,7 +1881,10 @@ mod tests {
 
         assert_eq!(
             git(&repo, &["remote", "get-url", "origin"]).unwrap(),
-            moved.join("demo-repos/nanochat.git").to_string_lossy()
+            moved
+                .join("demo-repos")
+                .join("nanochat.git")
+                .to_string_lossy()
         );
         std::fs::remove_dir_all(root).unwrap();
     }

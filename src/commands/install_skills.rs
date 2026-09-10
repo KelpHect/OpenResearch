@@ -278,9 +278,9 @@ mod tests {
         let lines: Vec<&str> = body.lines().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("Claude Code"));
-        assert!(lines[0].contains(".claude/skills/orx/SKILL.md"));
+        assert!(lines[0].contains(&tilde(&claude.skill_target().unwrap())));
         assert!(lines[1].contains("Cursor"));
-        assert!(lines[1].contains(".cursor/skills/orx/SKILL.md"));
+        assert!(lines[1].contains(&tilde(&cursor.skill_target().unwrap())));
     }
 
     #[test]
@@ -315,8 +315,8 @@ mod tests {
         let extras = codex.extra_skill_targets();
         assert_eq!(extras.len(), 1, "one legacy prompt");
         assert!(
-            extras[0].0.ends_with(".codex/prompts/orx.md"),
-            "legacy prompt path, got {}",
+            extras[0].0 == codex.config_home().unwrap().join("prompts/orx.md"),
+            "legacy prompt path should follow CODEX_HOME, got {}",
             extras[0].0.display()
         );
 

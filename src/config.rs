@@ -62,13 +62,27 @@ pub struct Credentials {
 }
 
 pub(crate) fn config_dir() -> PathBuf {
+    #[cfg(windows)]
     let base = crate::local::shell_env::var("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::config_dir()
+                .or_else(dirs::home_dir)
+                .unwrap_or_else(|| PathBuf::from("."))
+        });
+    #[cfg(not(windows))]
+    let base = crate::local::shell_env::var("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(".config")
         });
+    #[cfg(windows)]
+    return base.join("OpenResearch");
+    #[cfg(not(windows))]
     base.join("openresearch")
 }
 
@@ -306,7 +320,7 @@ pub fn set_github_default_prompt_seen(seen: bool) -> Result<()> {
 /// format the api writes: `export KEY='value'` with `\` doubled and `'`
 /// written as `'\''`.
 pub fn synced_env_var(key: &str) -> Option<String> {
-    let path = dirs::home_dir()?.join(".openresearch").join("env");
+    let path = synced_env_path()?;
     let content = std::fs::read_to_string(path).ok()?;
     let prefix = format!("export {key}='");
     for line in content.lines() {
@@ -328,7 +342,7 @@ pub fn synced_env_var(key: &str) -> Option<String> {
 /// All vars in the synced env file, in file order (same format as
 /// `synced_env_var`). Malformed lines are skipped.
 pub fn list_synced_env() -> Vec<(String, String)> {
-    let Some(path) = dirs::home_dir().map(|h| h.join(".openresearch").join("env")) else {
+    let Some(path) = synced_env_path() else {
         return Vec::new();
     };
     let Ok(content) = std::fs::read_to_string(path) else {
@@ -355,7 +369,7 @@ pub fn list_synced_env() -> Vec<(String, String)> {
 
 /// Drop `key`'s line from the synced env file. Missing file/key is a no-op.
 pub fn remove_synced_env_var(key: &str) -> Result<()> {
-    let Some(path) = dirs::home_dir().map(|h| h.join(".openresearch").join("env")) else {
+    let Some(path) = synced_env_path() else {
         return Ok(());
     };
     let Ok(existing) = std::fs::read_to_string(&path) else {
@@ -384,11 +398,11 @@ pub fn write_synced_env_var(key: &str, value: &str) -> Result<()> {
 
 pub fn write_synced_env_vars(values: &[(&str, &str)]) -> Result<()> {
     use anyhow::anyhow;
-    let dir = dirs::home_dir()
-        .ok_or_else(|| anyhow!("no home directory"))?
-        .join(".openresearch");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("env");
+    let path = synced_env_path().ok_or_else(|| anyhow!("no config directory"))?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow!("config directory has no parent"))?;
+    std::fs::create_dir_all(dir)?;
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let mut lines: Vec<String> = existing.lines().map(str::to_string).collect();
     for (key, value) in values {
@@ -430,4 +444,13 @@ pub fn write_synced_env_vars(values: &[(&str, &str)]) -> Result<()> {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
+}
+
+fn synced_env_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        Some(config_dir().join("env"))
+    }
+    #[cfg(not(windows))]
+    dirs::home_dir().map(|home| home.join(".openresearch").join("env"))
 }

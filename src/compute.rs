@@ -214,9 +214,9 @@ fn install_content_addressed(
     }
 }
 
-fn restrict_snapshot_file(path: &Path) -> Result<()> {
+fn restrict_snapshot_file(_path: &Path) -> Result<()> {
     #[cfg(unix)]
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::set_permissions(_path, std::fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
@@ -226,6 +226,24 @@ pub fn snapshot_script(archive_path: &str, command: &str) -> String {
         shell_quote(archive_path),
         command
     )
+}
+
+/// Build the local-controller form of a snapshot script. Remote backends keep
+/// using POSIX shell regardless of the controller OS, while a Windows local
+/// run is executed by PowerShell.
+pub fn local_snapshot_script(archive_path: &str, command: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!(
+            "$ErrorActionPreference = 'Stop'; New-Item -ItemType Directory -Force -Path 'repo' | Out-Null; tar -xf {} -C repo; Set-Location -LiteralPath 'repo'; {}",
+            crate::sys::ps_quote(archive_path),
+            command
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        snapshot_script(archive_path, command)
+    }
 }
 
 pub fn staged_script(command: &str) -> String {
