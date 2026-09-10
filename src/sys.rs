@@ -209,6 +209,7 @@ pub fn is_exdev(error: &std::io::Error) -> bool {
 }
 
 /// Single-quote a string for PowerShell.
+#[cfg(windows)]
 pub fn ps_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
