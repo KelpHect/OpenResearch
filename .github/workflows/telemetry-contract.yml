@@ -10,7 +10,7 @@ on:
 jobs:
   verify:
     name: verify production telemetry contract
-    if: ${{ github.repository == 'alphaXiv/OpenResearch' && !fromJson(inputs.plan).announcement_tag_is_implicit }}
+    if: ${{ !fromJson(inputs.plan).announcement_tag_is_implicit }}
     runs-on: ubuntu-22.04
     env:
       ORX_OFFICIAL_RELEASE_BUILD: "1"

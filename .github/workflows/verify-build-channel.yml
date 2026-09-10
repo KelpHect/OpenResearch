@@ -24,9 +24,7 @@ jobs:
       - name: Verify packaged binary
         shell: bash
         env:
-          # Only the first-party repository may produce production telemetry
-          # builds. Fork releases are installable development builds.
-          EXPECTED_BUILD_CHANNEL: ${{ github.repository == 'alphaXiv/OpenResearch' && !fromJson(inputs.plan).announcement_tag_is_implicit && 'production' || 'development' }}
+          EXPECTED_BUILD_CHANNEL: ${{ fromJson(inputs.plan).announcement_tag_is_implicit && 'development' || 'production' }}
           ORX_TELEMETRY_ENV: "off"
           TARGETS_JSON: ${{ toJson(matrix.targets) }}
           XDG_CONFIG_HOME: ${{ runner.temp }}/orx-build-channel

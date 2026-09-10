@@ -132,7 +132,7 @@ jobs:
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
       - name: "Mark official release build"
-        if: "needs.plan.outputs.publishing == 'true' && github.repository == 'alphaXiv/OpenResearch'"
+        if: "needs.plan.outputs.publishing == 'true'"
         run: "echo \"ORX_OFFICIAL_RELEASE_BUILD=1\" >> \"$GITHUB_ENV\""
         shell: "bash"
       - name: Install dist
