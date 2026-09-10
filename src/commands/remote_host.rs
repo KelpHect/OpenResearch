@@ -703,7 +703,13 @@ async fn wait_for_server_lock_free(data_dir: &Path) -> Result<()> {
 
 #[cfg(unix)]
 async fn connect_control(path: &Path) -> Result<ControlStream> {
-    Ok(Box::new(UnixStream::connect(path).await?))
+    match UnixStream::connect(path).await {
+        Ok(stream) => Ok(Box::new(stream)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(anyhow!(
+            "No persistent OpenResearch host is running for this data directory."
+        )),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[cfg(windows)]
@@ -711,7 +717,13 @@ async fn connect_control(path: &Path) -> Result<ControlStream> {
     let name = path
         .to_str()
         .ok_or_else(|| anyhow!("Invalid Windows control-pipe name."))?;
-    Ok(Box::new(ClientOptions::new().open(name)?))
+    match ClientOptions::new().open(name) {
+        Ok(stream) => Ok(Box::new(stream)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(anyhow!(
+            "No persistent OpenResearch host is running for this data directory."
+        )),
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn control_exchange(data_dir: &Path, request: &ControlRequest) -> Result<ControlResponse> {
