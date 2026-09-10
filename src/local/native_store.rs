@@ -284,6 +284,114 @@ fn prepare_links(root: &Path, lock_root: &Path, sources: &[PathBuf]) -> Result<(
     Ok(())
 }
 
+#[cfg(windows)]
+fn reconcile_link(source: &Path, destination: &Path) -> Result<()> {
+    // Creating a Windows symbolic link requires Developer Mode or an
+    // administrator token.  Neither is a reasonable prerequisite for a normal
+    // CLI install, so Windows uses a managed copy with the same conflict
+    // semantics as the Unix link below.  The marker records the source
+    // fingerprint from the previous reconciliation, allowing us to distinguish
+    // a source-only change from an isolated-session change.
+    let name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config");
+    let marker = destination.with_file_name(format!("{name}.orx-managed-link"));
+    match std::fs::symlink_metadata(source) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Ok(destination_metadata) = std::fs::symlink_metadata(destination) {
+                if destination_metadata.file_type().is_symlink() {
+                    if std::fs::read_link(destination).is_ok_and(|target| target == source) {
+                        remove_link(destination)?;
+                    } else if marker.is_file() {
+                        // Do not inspect a possibly dangling, unrelated link:
+                        // metadata() would follow it and fail. Preserve it as
+                        // a user conflict instead.
+                        preserve_conflict(destination)?;
+                    }
+                } else if marker.is_file() {
+                    let previous = std::fs::read_to_string(&marker).unwrap_or_default();
+                    let current = managed_fingerprint(destination)?.unwrap_or_default();
+                    if current != previous {
+                        preserve_conflict(destination)?;
+                    } else {
+                        remove_link(destination)?;
+                    }
+                }
+            }
+            if marker.is_file() {
+                std::fs::remove_file(marker)?;
+            }
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let source_fingerprint = managed_fingerprint(source)?.ok_or_else(|| {
+        anyhow!(
+            "Cannot mirror unsupported native state {} into {}.",
+            source.display(),
+            destination.display()
+        )
+    })?;
+
+    match std::fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            if std::fs::read_link(destination).is_ok_and(|target| target == source) {
+                remove_link(destination)?;
+            } else {
+                preserve_conflict(destination)?;
+            }
+        }
+        Ok(_) => {
+            match std::fs::read_to_string(&marker) {
+                Ok(previous) => {
+                    let current = managed_fingerprint(destination)?.unwrap_or_default();
+                    if current == source_fingerprint {
+                        // The destination already mirrors the source.  This
+                        // also upgrades a marker left by an older copy
+                        // implementation.
+                        if previous != source_fingerprint {
+                            write_marker(&marker, source)?;
+                        }
+                        return Ok(());
+                    }
+                    if previous == source_fingerprint {
+                        // The isolated copy changed; adopt it into the user's
+                        // native store before rebuilding the mirror.
+                        adopt_managed_copy(destination, source)?;
+                    } else if current == previous {
+                        // Only the legacy source changed, so refresh the
+                        // isolated copy.
+                        remove_link(destination)?;
+                    } else {
+                        // Both sides changed since the last reconciliation.
+                        // Keep the isolated work rather than silently
+                        // discarding it.
+                        preserve_conflict(destination)?;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    preserve_conflict(destination)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    create_symlink(source, destination).map_err(|error| {
+        anyhow!(
+            "could not mirror {} to {}: {error}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    write_marker(&marker, source)?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
 fn reconcile_link(source: &Path, destination: &Path) -> Result<()> {
     let name = destination
         .file_name()
@@ -371,6 +479,88 @@ fn preserve_conflict(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn adopt_managed_copy(from: &Path, to: &Path) -> Result<()> {
+    let name = to
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config");
+    let id = uuid::Uuid::new_v4();
+    let backup = to.with_file_name(format!(".{name}.orx-backup"));
+    let staged = to.with_file_name(format!(".{name}.orx-staged-{id}"));
+    copy_path(from, &staged)?;
+    if std::fs::symlink_metadata(&backup).is_ok() {
+        remove_link(&backup)?;
+    }
+    std::fs::rename(to, &backup)?;
+    if let Err(error) = std::fs::rename(&staged, to) {
+        let _ = std::fs::rename(&backup, to);
+        let _ = remove_link(&staged);
+        return Err(error.into());
+    }
+    remove_link(from)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn managed_fingerprint(path: &Path) -> Result<Option<String>> {
+    let metadata = std::fs::metadata(path)?;
+    if metadata.is_file() {
+        return file_hash(path);
+    }
+    if !metadata.is_dir() {
+        return Ok(None);
+    }
+
+    fn visit(path: &Path, hash: &mut Sha256) -> Result<()> {
+        let mut entries = std::fs::read_dir(path)
+            .map(|entries| entries.collect::<std::result::Result<Vec<_>, std::io::Error>>())??;
+        entries.sort_by_cached_key(|entry| entry.file_name().to_string_lossy().into_owned());
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let child = entry.path();
+            let metadata = std::fs::metadata(&child)?;
+            if metadata.is_dir() {
+                hash.update(b"d\0");
+                hash.update(name.as_bytes());
+                hash.update([0]);
+                visit(&child, hash)?;
+            } else if metadata.is_file() {
+                hash.update(b"f\0");
+                hash.update(name.as_bytes());
+                hash.update([0]);
+                let mut file = std::fs::File::open(&child)?;
+                std::io::copy(&mut file, hash)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut hash = Sha256::new();
+    visit(path, &mut hash)?;
+    Ok(Some(format!("{:x}", hash.finalize())))
+}
+
+#[cfg(windows)]
+fn copy_path(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::metadata(source)?;
+    if metadata.is_dir() {
+        std::fs::create_dir_all(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            copy_path(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+    } else if metadata.is_file() {
+        std::fs::copy(source, destination)?;
+    } else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("unsupported native state {}", source.display()),
+        ));
+    }
+    Ok(())
+}
+
 fn file_hash(path: &Path) -> Result<Option<String>> {
     if path.is_file() {
         Ok(Some(format!("{:x}", Sha256::digest(std::fs::read(path)?))))
@@ -380,7 +570,11 @@ fn file_hash(path: &Path) -> Result<Option<String>> {
 }
 
 fn write_marker(marker: &Path, source: &Path) -> Result<()> {
-    std::fs::write(marker, file_hash(source)?.unwrap_or_default())?;
+    #[cfg(windows)]
+    let fingerprint = managed_fingerprint(source)?.unwrap_or_default();
+    #[cfg(not(windows))]
+    let fingerprint = file_hash(source)?.unwrap_or_default();
+    std::fs::write(marker, fingerprint)?;
     Ok(())
 }
 
@@ -393,11 +587,11 @@ fn remove_link(path: &Path) -> std::io::Result<()> {
 fn remove_link(path: &Path) -> std::io::Result<()> {
     use std::os::windows::fs::FileTypeExt;
 
-    if std::fs::symlink_metadata(path)?
-        .file_type()
-        .is_symlink_dir()
-    {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink_dir() {
         std::fs::remove_dir(path)
+    } else if metadata.is_dir() {
+        std::fs::remove_dir_all(path)
     } else {
         std::fs::remove_file(path)
     }
@@ -409,32 +603,21 @@ fn create_symlink(source: &Path, destination: &Path) -> std::io::Result<()> {
 }
 
 pub(crate) fn copy_symlink(source: &Path, destination: &Path) -> std::io::Result<()> {
-    let target = std::fs::read_link(source)?;
     #[cfg(unix)]
-    return std::os::unix::fs::symlink(target, destination);
+    return std::os::unix::fs::symlink(std::fs::read_link(source)?, destination);
     #[cfg(windows)]
-    if source.metadata()?.is_dir() {
-        std::os::windows::fs::symlink_dir(target, destination)
-    } else {
-        std::os::windows::fs::symlink_file(target, destination)
-    }
+    copy_path(source, destination)
 }
 
 #[cfg(windows)]
 fn create_symlink(source: &Path, destination: &Path) -> std::io::Result<()> {
-    if source.is_dir() {
-        std::os::windows::fs::symlink_dir(source, destination)
-    } else {
-        std::os::windows::fs::symlink_file(source, destination)
-    }
+    copy_path(source, destination)
 }
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     fn native_store_smoke_test() {
         let root = std::env::temp_dir().join(format!("orx-native-store-{}", uuid::Uuid::new_v4()));
@@ -457,10 +640,14 @@ mod tests {
             .unwrap()
             .flatten()
             .any(|entry| entry.file_name().to_string_lossy().ends_with(".orx-backup")));
-        assert!(std::fs::symlink_metadata(isolated.join("config.toml"))
+        let isolated_config = isolated.join("config.toml");
+        #[cfg(unix)]
+        assert!(std::fs::symlink_metadata(&isolated_config)
             .unwrap()
             .file_type()
             .is_symlink());
+        #[cfg(windows)]
+        assert_eq!(std::fs::read_to_string(&isolated_config).unwrap(), "new");
         std::fs::remove_file(isolated.join("config.toml")).unwrap();
         std::fs::write(isolated.join("config.toml"), "isolated change").unwrap();
         std::fs::write(&source, "legacy change").unwrap();
@@ -494,6 +681,49 @@ mod tests {
             .unwrap();
         assert!(opencode_has_session(&db, "id").unwrap());
         assert!(!opencode_has_session(&db, "missing").unwrap());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_native_store_mirrors_and_adopts_directories() {
+        let root =
+            std::env::temp_dir().join(format!("orx-native-store-dir-{}", uuid::Uuid::new_v4()));
+        let source = root.join("legacy/plugins");
+        let isolated = root.join("isolated");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("plugin.json"), "legacy").unwrap();
+
+        prepare_links(
+            &isolated,
+            &root.join("legacy"),
+            std::slice::from_ref(&source),
+        )
+        .unwrap();
+        let mirrored = isolated.join("plugins");
+        std::fs::write(mirrored.join("plugin.json"), "session change").unwrap();
+        prepare_links(
+            &isolated,
+            &root.join("legacy"),
+            std::slice::from_ref(&source),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(source.join("plugin.json")).unwrap(),
+            "session change"
+        );
+
+        std::fs::write(source.join("plugin.json"), "legacy change").unwrap();
+        prepare_links(
+            &isolated,
+            &root.join("legacy"),
+            std::slice::from_ref(&source),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(mirrored.join("plugin.json")).unwrap(),
+            "legacy change"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 }

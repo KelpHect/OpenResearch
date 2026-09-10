@@ -211,7 +211,12 @@ pub fn exe_matches_prefix(exe: &Path, prefix: &Path) -> bool {
     } else {
         dir
     };
-    dir == prefix
+    if cfg!(windows) {
+        dir.to_string_lossy()
+            .eq_ignore_ascii_case(&prefix.to_string_lossy())
+    } else {
+        dir == prefix
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1409,5 +1414,10 @@ mod tests {
                 prefix
             );
         }
+        #[cfg(windows)]
+        assert!(exe_matches_prefix(
+            Path::new(r"C:\Users\Research\.cargo\bin\orx.exe"),
+            Path::new(r"c:\users\research\.cargo")
+        ));
     }
 }

@@ -239,6 +239,10 @@ pub async fn git_response(
         .args(["cat-file", "blob", &spec])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        // If the HTTP client disconnects while a large blob is being read,
+        // dropping the body must not leave git running (and holding the
+        // repository open on Windows).
+        .kill_on_drop(true)
         .spawn()
         .map_err(|error| anyhow!("Could not run git: {error}"))?;
     let mut stdout = child
@@ -261,18 +265,83 @@ pub async fn git_response(
             return Err(anyhow!("git stream failed: {error}"));
         }
     }
-    let reader = stdout.take(selection.length);
-    tokio::spawn(async move {
-        let _ = child.wait().await;
-    });
+    // Keep the child together with the stream rather than spawning an
+    // unobservable waiter.  In particular, Windows does not allow the test
+    // repository (or a checkout being replaced) to be removed while git still
+    // has its working directory open.  A ranged response terminates git after
+    // the requested bytes; a full response reaps it normally after the exact
+    // blob length has been read.  The same ownership also lets kill_on_drop
+    // clean up if the client abandons the response.
+    let full_response = range.is_none();
+    let stream = futures::stream::unfold(
+        Some(GitBodyState {
+            child,
+            stdout,
+            remaining: selection.length,
+            full_response,
+        }),
+        |state| async move {
+            let mut state = state?;
+            if state.remaining == 0 {
+                state.finish().await;
+                return None;
+            }
+            let chunk_size = state.remaining.min(64 * 1024) as usize;
+            let mut chunk = vec![0u8; chunk_size];
+            match state.stdout.read(&mut chunk).await {
+                Ok(0) => {
+                    state.stop().await;
+                    Some((
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "git returned fewer bytes than its recorded blob size",
+                        )),
+                        None,
+                    ))
+                }
+                Ok(read) => {
+                    chunk.truncate(read);
+                    state.remaining -= read as u64;
+                    Some((Ok(chunk), Some(state)))
+                }
+                Err(error) => {
+                    state.stop().await;
+                    Some((Err(error), None))
+                }
+            }
+        },
+    );
     response(
         type_path,
         presentation,
         size,
         range,
         "no-cache",
-        Body::from_stream(ReaderStream::new(reader)),
+        Body::from_stream(stream),
     )
+}
+
+/// State owned by the response stream for a `git cat-file` body.
+struct GitBodyState {
+    child: tokio::process::Child,
+    stdout: tokio::process::ChildStdout,
+    remaining: u64,
+    full_response: bool,
+}
+
+impl GitBodyState {
+    async fn finish(&mut self) {
+        if self.full_response {
+            let _ = self.child.wait().await;
+        } else {
+            self.stop().await;
+        }
+    }
+
+    async fn stop(&mut self) {
+        let _ = self.child.kill().await;
+        let _ = self.child.wait().await;
+    }
 }
 
 #[cfg(test)]

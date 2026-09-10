@@ -135,7 +135,14 @@ pub fn pid_alive(pid: &str) -> bool {
             Ok(output) if output.status.success() => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stdout = stdout.trim();
-                !stdout.is_empty() && !stdout.contains("No tasks") && stdout.contains(pid)
+                let pid_field = format!("\",\"{pid}\",\"");
+                !stdout.is_empty()
+                    && !stdout.contains("No tasks")
+                    // `tasklist /FO CSV` quotes each field. Match the complete
+                    // PID field rather than using `contains(pid)`: PID 12 must
+                    // not be considered alive because PID 312 is listed, and
+                    // a process image name is allowed to contain commas.
+                    && stdout.lines().any(|line| line.contains(&pid_field))
             }
             _ => false,
         }

@@ -36,14 +36,23 @@ pub fn find_opencode() -> Result<PathBuf> {
         return Ok(found);
     }
     if let Some(home) = dirs::home_dir() {
-        let fallback = home.join(".opencode").join("bin").join("opencode");
-        if fallback.is_file() {
-            return Ok(fallback);
+        #[cfg(windows)]
+        let candidates = [
+            home.join(".opencode/bin/opencode.exe"),
+            home.join(".opencode/bin/opencode.cmd"),
+        ];
+        #[cfg(not(windows))]
+        let candidates = [home.join(".opencode/bin/opencode")];
+        if let Some(found) = candidates.into_iter().find(|candidate| candidate.is_file()) {
+            return Ok(found);
         }
     }
+    #[cfg(windows)]
+    let install = "Install it with: irm https://opencode.ai/install | iex";
+    #[cfg(not(windows))]
+    let install = "Install it with: curl -fsSL https://opencode.ai/install | bash";
     Err(anyhow!(
-        "opencode not found (checked PATH and ~/.opencode/bin/opencode).\n\
-         Install it with: curl -fsSL https://opencode.ai/install | bash"
+        "opencode not found (checked PATH and ~/.opencode/bin/opencode).\n{install}"
     ))
 }
 
