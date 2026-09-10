@@ -11,7 +11,7 @@ literature, develop hypotheses, run experiments, and produce research artifacts.
 
 [Download the desktop app](https://openresearch.sh/download) ·
 [Documentation](https://openresearch.sh/docs) ·
-[Releases](https://github.com/alphaXiv/OpenResearch/releases)
+[Releases](https://github.com/KelpHect/OpenResearch/releases)
 
 </div>
 
@@ -29,7 +29,7 @@ orx up
 On Windows, run the PowerShell installer:
 
 ```powershell
-irm https://github.com/alphaXiv/OpenResearch/releases/latest/download/openresearch-cli-installer.ps1 | iex
+irm https://github.com/KelpHect/OpenResearch/releases/latest/download/openresearch-cli-installer.ps1 | iex
 orx up
 ```
 

@@ -3,7 +3,7 @@ name = "openresearch-cli"
 version = "0.1.122"
 edition = "2021"
 description = "OpenResearch CLI (orx) — Rust port"
-repository = "https://github.com/alphaXiv/OpenResearch"
+repository = "https://github.com/KelpHect/OpenResearch"
 license = "MIT"
 
 [[bin]]

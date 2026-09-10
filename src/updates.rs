@@ -30,7 +30,7 @@ use crate::error::{anyhow, Result};
 pub mod macos_app;
 
 /// GitHub repo the released binaries come from.
-pub const REPO_URL: &str = "https://github.com/alphaXiv/OpenResearch";
+pub const REPO_URL: &str = "https://github.com/KelpHect/OpenResearch";
 
 /// The cargo-dist app name (the *package* name, not the `orx` bin name) — used
 /// in release asset names and the receipt path.
@@ -349,11 +349,11 @@ pub fn auto_update_eligible() -> bool {
 fn install_hint() -> &'static str {
     #[cfg(windows)]
     {
-        "powershell -NoProfile -ExecutionPolicy Bypass -Command \"irm https://github.com/alphaXiv/OpenResearch/releases/latest/download/openresearch-cli-installer.ps1 | iex\""
+        "powershell -NoProfile -ExecutionPolicy Bypass -Command \"irm https://github.com/KelpHect/OpenResearch/releases/latest/download/openresearch-cli-installer.ps1 | iex\""
     }
     #[cfg(not(windows))]
     {
-        "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/alphaXiv/OpenResearch/releases/latest/download/openresearch-cli-installer.sh | sh"
+        "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/KelpHect/OpenResearch/releases/latest/download/openresearch-cli-installer.sh | sh"
     }
 }
 
