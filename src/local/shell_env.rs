@@ -66,18 +66,23 @@ fn search_in(paths: &OsStr, binary: &str) -> Option<PathBuf> {
     // pick up a binary.
     #[cfg(windows)]
     {
-        let mut names = vec![binary.to_string()];
-        if Path::new(binary).extension().is_none() {
+        // PATHEXT executables first: an extensionless file with the same name
+        // (an npm-style `#!/bin/sh` shim, a shell alias file) is not directly
+        // executable via CreateProcess, so it must never shadow the real
+        // `.exe`/`.cmd`. The bare name stays as a last resort.
+        let mut names: Vec<String> = if Path::new(binary).extension().is_none() {
             let extensions = std::env::var_os("PATHEXT")
                 .map(|value| value.to_string_lossy().into_owned())
                 .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
-            names.extend(
-                extensions
-                    .split(';')
-                    .filter(|extension| !extension.is_empty())
-                    .map(|extension| format!("{binary}{extension}")),
-            );
-        }
+            extensions
+                .split(';')
+                .filter(|extension| !extension.is_empty())
+                .map(|extension| format!("{binary}{extension}"))
+                .collect()
+        } else {
+            vec![binary.to_string()]
+        };
+        names.push(binary.to_string());
         std::env::split_paths(paths)
             .filter(|dir| dir.is_absolute())
             .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
@@ -183,6 +188,30 @@ mod tests {
         // tests from the package root, so `src/main.rs` is a real hit here.
         let relative = std::env::join_paths([PathBuf::from("src")]).expect("join");
         assert_eq!(search_in(&relative, "main.rs"), None);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_search_prefers_executables_over_extensionless_shims() {
+        // npm drops an extensionless `#!/bin/sh` shim beside the real
+        // `tool.cmd`; CreateProcess cannot run the shim, so it must not win.
+        let root = std::env::temp_dir().join(format!("orx-path-shim-{}", std::process::id()));
+        let dir = root.join("bin");
+        std::fs::create_dir_all(&dir).expect("bin");
+        std::fs::write(dir.join("tool"), "#!/bin/sh\nexit 0\n").expect("shim");
+        std::fs::write(dir.join("tool.cmd"), "@ECHO off\n").expect("cmd");
+
+        let paths = std::env::join_paths([dir.clone()]).expect("join");
+        let found = search_in(&paths, "tool").expect("tool");
+        assert!(found
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&dir.join("tool.cmd").to_string_lossy()));
+
+        // Without any PATHEXT hit the bare name is still a last resort.
+        std::fs::remove_file(dir.join("tool.cmd")).ok();
+        assert_eq!(search_in(&paths, "tool"), Some(dir.join("tool")));
 
         std::fs::remove_dir_all(&root).ok();
     }

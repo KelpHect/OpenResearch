@@ -22,7 +22,7 @@
 //! fallback for a CLI too old for `--verbose`).
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -47,10 +47,9 @@ use crate::local::chat::{
 };
 use crate::local::local_models::is_loopback_url;
 use crate::local::native_store::{self, NativeStore};
-use crate::local::opencode::find_opencode;
+use crate::local::opencode::{find_opencode_bin, AgentEndpoint, OpenCodeBin, OpenCodeVersion};
 
-const OPENCODE_REINSTALL: &str =
-    "Reinstall opencode (curl -fsSL https://opencode.ai/install | bash)";
+const OPENCODE_REINSTALL: &str = "Reinstall opencode2 (npm i -g @opencode/cli)";
 
 pub struct OpenCode;
 
@@ -69,27 +68,23 @@ impl Harness for OpenCode {
     }
 
     async fn one_shot(&self, request: OneShot<'_>) -> Option<String> {
-        opencode_one_shot(&find_opencode().ok()?, request).await
+        let bin = find_opencode_bin().ok()?;
+        opencode_one_shot(&bin, request).await
     }
 
     async fn detect(&self) -> Option<HarnessInfo> {
         let mut info = HarnessInfo::new(self.id(), self.name());
         let mut models = Vec::new();
         let mut config = Value::Null;
-        let bin = find_opencode().ok();
+        let bin = find_opencode_bin().ok();
         if let Some(bin) = &bin {
-            info.record_bin(bin, probe_bin(bin).await);
+            info.record_bin(&bin.path, probe_bin(&bin.path).await);
             // A binary that failed `--version` has no catalog to give either.
             if !info.install_broken {
-                let (catalog, resolved) = tokio::join!(
-                    opencode_models(bin),
-                    run_models(bin, &["debug", "config", "--pure"])
-                );
+                let (catalog, resolved) =
+                    tokio::join!(opencode_models(&bin.path), opencode_debug_config(bin));
                 models = catalog;
-                config = match resolved.and_then(|text| serde_json::from_str(&text).ok()) {
-                    Some(config) => config,
-                    None => Value::Null,
-                };
+                config = resolved.unwrap_or(Value::Null);
             }
         }
         apply_configured_labels(&mut models, &config);
@@ -179,7 +174,7 @@ impl Harness for OpenCode {
                         .join(", "),
                 );
                 let note = format!(
-                    "{} rejected the stored API key, so its models are hidden. Re-add it with `opencode auth login`.",
+                    "{} rejected the stored API key, so its models are hidden. Re-add it with `opencode2 auth login`.",
                     dead.join(", ")
                 );
                 info.agent_note = Some(match info.agent_note.take() {
@@ -199,21 +194,21 @@ impl Harness for OpenCode {
             info.agent_note = Some(if available.is_empty() {
                 "Local model server unavailable or configured model not found. Start the server, load your model, and re-check OpenCode."
             } else {
-                "The local server is reachable, but OpenCode did not list the configured model. Check `opencode models` and re-check OpenCode."
+                "The local server is reachable, but OpenCode did not list the configured model. Check `opencode2 models` and re-check OpenCode."
             }.to_string());
         } else if info.installed && info.authenticated {
             info.agent_note = Some(
-                "OpenCode listed no models. Check `opencode models` and re-check OpenCode."
+                "OpenCode listed no models. Check `opencode2 models` and re-check OpenCode."
                     .to_string(),
             );
         } else if info.installed {
             info.agent_note = Some(
-                "Configure a local model in OpenCode, or sign in with `opencode auth login`."
+                "Configure a local model in OpenCode, or sign in with `opencode2 auth login`."
                     .to_string(),
             );
         } else {
             info.agent_note = Some(
-                "Install opencode (curl -fsSL https://opencode.ai/install | bash), then configure a local model or sign in with `opencode auth login`."
+                "Install opencode2 (npm i -g @opencode/cli), then configure a local model or sign in with `opencode2 auth login`."
                     .to_string(),
             );
         }
@@ -333,7 +328,11 @@ fn opencode_providers() -> Vec<String> {
 /// auth.json version so a paid probe runs once, not once per detection, and
 /// only when the child actually answered — a timeout or spawn failure is not
 /// remembered, so a dead key is still found on the next detection.
-async fn dead_providers(bin: &Path, providers: &[String], models: &[ModelInfo]) -> Vec<String> {
+async fn dead_providers(
+    bin: &OpenCodeBin,
+    providers: &[String],
+    models: &[ModelInfo],
+) -> Vec<String> {
     static VERDICTS: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
     let verdicts = VERDICTS.get_or_init(Default::default);
     let version = opencode_auth_path()
@@ -378,9 +377,78 @@ async fn dead_providers(bin: &Path, providers: &[String], models: &[ModelInfo]) 
         .collect()
 }
 
+/// `opencode debug config` — the resolved config plus the default model. v1
+/// takes `--pure`; v2 dropped that flag, so fall back to the bare command.
+/// v2 answers a JSON *array* of config sources (`[{type, path, info}]`);
+/// normalize it to the v1-like object the provider/model readers expect.
+async fn opencode_debug_config(bin: &OpenCodeBin) -> Option<Value> {
+    let args: &[&[&str]] = if bin.version == OpenCodeVersion::V2 {
+        &[&["debug", "config"]]
+    } else {
+        &[&["debug", "config", "--pure"], &["debug", "config"]]
+    };
+    for args in args {
+        if let Some(out) = run_models(&bin.path, args).await {
+            if let Ok(config) = serde_json::from_str::<Value>(&out) {
+                return Some(normalize_debug_config(&config));
+            }
+        }
+    }
+    None
+}
+
+/// Fold a v2 `debug config` source array into the v1-like object shape
+/// (`{model, provider, enabled_providers, disabled_providers}`); a v1 object
+/// passes through untouched.
+fn normalize_debug_config(config: &Value) -> Value {
+    let Some(sources) = config.as_array() else {
+        return config.clone();
+    };
+    let mut merged = serde_json::Map::new();
+    let mut providers = serde_json::Map::new();
+    for source in sources {
+        let Some(info) = source.get("info") else {
+            continue;
+        };
+        if merged.get("model").is_none() {
+            if let Some(model) = info.get("model").and_then(|model| match model {
+                Value::String(id) => Some(id.clone()),
+                Value::Object(map) => {
+                    let provider = map.get("providerID")?.as_str()?;
+                    let id = map
+                        .get("model")
+                        .or_else(|| map.get("modelID"))
+                        .and_then(Value::as_str)?;
+                    Some(format!("{provider}/{id}"))
+                }
+                _ => None,
+            }) {
+                merged.insert("model".into(), Value::String(model));
+            }
+        }
+        if let Some(map) = info.get("providers").and_then(Value::as_object) {
+            for (id, provider) in map {
+                providers
+                    .entry(id.clone())
+                    .or_insert_with(|| provider.clone());
+            }
+        }
+        for key in ["enabled_providers", "disabled_providers"] {
+            if merged.get(key).is_none() {
+                if let Some(list) = info.get(key) {
+                    merged.insert(key.into(), list.clone());
+                }
+            }
+        }
+    }
+    if !providers.is_empty() {
+        merged.insert("provider".into(), Value::Object(providers));
+    }
+    Value::Object(merged)
+}
 /// `Some(true)` when the provider answered with an authentication error,
 /// `Some(false)` for any other answer, `None` when the child never answered.
-async fn probe_rejects_key(bin: &Path, model: &str) -> Option<bool> {
+async fn probe_rejects_key(bin: &OpenCodeBin, model: &str) -> Option<bool> {
     let out = opencode_child(
         bin,
         Some(model),
@@ -541,7 +609,7 @@ async fn opencode_models(bin: &PathBuf) -> Vec<super::ModelInfo> {
 /// claude/codex one-shot children. opencode has no system-prompt flag, so
 /// `system` leads the message. Any failure lands on `None` and the caller
 /// keeps its fallback.
-async fn opencode_one_shot(bin: &Path, request: OneShot<'_>) -> Option<String> {
+async fn opencode_one_shot(bin: &OpenCodeBin, request: OneShot<'_>) -> Option<String> {
     let message = format!("{}\n\n{}", request.system, request.prompt);
     let out = opencode_child(bin, request.model, &message, request.timeout).await?;
     out.status
@@ -553,19 +621,23 @@ async fn opencode_one_shot(bin: &Path, request: OneShot<'_>) -> Option<String> {
 /// not be started, had no isolated store, or ran past `timeout`.
 ///
 /// The message embeds untrusted text, so the child must not be able to act on
-/// it: the built-in read-only `plan` agent denies writes, `--pure` skips
-/// external plugins, and the temp cwd keeps any residual reads away from real
-/// repos. A tool call that still asks for permission just blocks the child
-/// until the timeout kills it.
+/// it: the built-in read-only `plan` agent denies writes, `--pure` (v1 only —
+/// v2 dropped the flag) skips external plugins, and the temp cwd keeps any
+/// residual reads away from real repos. A tool call that still asks for
+/// permission just blocks the child until the timeout kills it.
 async fn opencode_child(
-    bin: &Path,
+    bin: &OpenCodeBin,
     model: Option<&str>,
     message: &str,
     timeout: Duration,
 ) -> Option<std::process::Output> {
-    let mut cmd = crate::sys::tokio_command(bin);
-    cmd.args(["run", "--agent", "plan", "--pure"])
-        .args(model.iter().flat_map(|model| ["--model", model]))
+    let mut cmd = crate::sys::tokio_command(&bin.path);
+    cmd.args(["run", "--agent", "plan"]);
+    // v2 removed `--pure`; passing it fails the whole invocation.
+    if bin.version == OpenCodeVersion::V1 {
+        cmd.arg("--pure");
+    }
+    cmd.args(model.iter().flat_map(|model| ["--model", model]))
         .arg(message)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -871,23 +943,80 @@ fn question_card(props: &Value, plan_exit_calls: &HashSet<String>) -> Option<Wir
     })
 }
 
-/// POST a permission decision to the live serve session (v1 API). `response` is
-/// `once` | `always` | `reject`.
+/// POST a permission decision to the live serve session. v1:
+/// `POST /session/{sid}/permissions/{id}` with `{response}`; v2:
+/// `POST /api/session/{sid}/permission/{id}/reply` with `{reply}`.
+/// `response` is `once` | `always` | `reject` on both generations.
 async fn post_permission(
     http: &reqwest::Client,
-    base: &str,
+    endpoint: &AgentEndpoint,
     native_session: &str,
     permission_id: &str,
     response: &str,
 ) -> Result<()> {
-    http.post(format!(
-        "{base}/session/{native_session}/permissions/{permission_id}"
-    ))
-    .json(&json!({ "response": response }))
-    .send()
-    .await?
-    .error_for_status()?;
+    let mut request = match endpoint.version {
+        OpenCodeVersion::V1 => http.post(format!(
+            "{}/session/{native_session}/permissions/{permission_id}",
+            endpoint.base()
+        )),
+        OpenCodeVersion::V2 => http.post(format!(
+            "{}/api/session/{native_session}/permission/{permission_id}/reply",
+            endpoint.base()
+        )),
+    };
+    if let Some((user, password)) = endpoint.auth() {
+        request = request.basic_auth(user, Some(password));
+    }
+    let body = match endpoint.version {
+        OpenCodeVersion::V1 => json!({ "response": response }),
+        OpenCodeVersion::V2 => json!({ "reply": response }),
+    };
+    request.json(&body).send().await?.error_for_status()?;
     Ok(())
+}
+
+/// GET a document from the live serve session, applying the v2 Basic
+/// credential when the endpoint needs one. Callers classify the response
+/// with [`opencode_setup_response`] (retryable) or `error_for_status`
+/// (reply paths, where failure falls back to surfacing the card).
+async fn serve_get(
+    http: &reqwest::Client,
+    endpoint: &AgentEndpoint,
+    url: String,
+) -> Result<reqwest::Response> {
+    let mut request = http.get(url);
+    if let Some((user, password)) = endpoint.auth() {
+        request = request.basic_auth(user, Some(password));
+    }
+    Ok(request.send().await?)
+}
+
+/// POST a JSON body to the live serve session, applying the v2 Basic
+/// credential when the endpoint needs one. See [`serve_get`] for response
+/// handling.
+async fn serve_post(
+    http: &reqwest::Client,
+    endpoint: &AgentEndpoint,
+    url: String,
+    body: &Value,
+) -> Result<reqwest::Response> {
+    let mut request = http.post(url).json(body);
+    if let Some((user, password)) = endpoint.auth() {
+        request = request.basic_auth(user, Some(password));
+    }
+    Ok(request.send().await?)
+}
+
+/// Unwrap a `{data: ...}` envelope when present, else use the value as-is —
+/// v2 list endpoints answer `{data: [...]}`.
+fn data_array(value: &Value) -> Vec<&Value> {
+    match value.get("data").and_then(Value::as_array) {
+        Some(items) => items.iter().collect(),
+        None => value
+            .as_array()
+            .map(|v| v.iter().collect())
+            .unwrap_or_default(),
+    }
 }
 
 /// Deliver an answered card's reply to the live serve session, unblocking the
@@ -912,43 +1041,29 @@ async fn reply_inline(ctx: &ResumeCtx, prompt: &WirePrompt, answer: &PromptAnswe
     // Reach this session's live serve child through the shared host, exactly
     // as `ChatHost::interrupt` does — the reply goes to the same loopback
     // serve whose `session.prompt` POST is paused on this prompt.
-    let port = ctx
+    let endpoint = ctx
         .host
         .opencode
-        .port_for(&ctx.session_id)
+        .endpoint_for(&ctx.session_id)
         .await
         .ok_or_else(|| anyhow!("opencode serve is not running — cannot deliver the reply"))?;
-    let base = format!("http://127.0.0.1:{port}");
     let http = ctx.http();
 
     match prompt.kind.as_str() {
         "permission" => {
             // approve → "always" (so the same tool won't re-prompt this turn);
-            // reject closes it. The reply is session-scoped in opencode's v1 API.
+            // reject closes it. The reply is session-scoped in opencode's API.
             let native_session = ctx.native_session_id.as_deref().ok_or_else(|| {
                 anyhow!("opencode session has no native id — cannot deliver the reply")
             })?;
             let response = if answer.approve { "always" } else { "reject" };
-            post_permission(http, &base, native_session, request_id, response).await?;
+            post_permission(http, &endpoint, native_session, request_id, response).await?;
         }
         "question" => {
-            if answer.answers.is_empty() {
-                // No selection: reject the question rather than reply empty, so
-                // opencode surfaces the model's fallback path.
-                http.post(format!("{base}/question/{request_id}/reject"))
-                    .json(&json!({}))
-                    .send()
-                    .await?
-                    .error_for_status()?;
-            } else {
-                // opencode takes an array of answers, one per question; we only
-                // surface the first question, so send a single answer array.
-                http.post(format!("{base}/question/{request_id}/reply"))
-                    .json(&json!({ "answers": [&answer.answers] }))
-                    .send()
-                    .await?
-                    .error_for_status()?;
-            }
+            let native_session = ctx.native_session_id.as_deref().ok_or_else(|| {
+                anyhow!("opencode session has no native id — cannot deliver the reply")
+            })?;
+            reply_question(http, &endpoint, native_session, prompt, answer).await?;
         }
         other => {
             return Err(anyhow!(
@@ -956,6 +1071,94 @@ async fn reply_inline(ctx: &ResumeCtx, prompt: &WirePrompt, answer: &PromptAnswe
             ))
         }
     }
+    Ok(())
+}
+
+/// Deliver an answered `question` card. v1: `POST /question/{id}/reply` with
+/// `{answers: [[label,...]]}` (or `/reject` on empty). v2: the card's
+/// `native_id` is a form id (`frm_*`) — map the chosen option labels back to
+/// field values and `POST /api/session/{sid}/form/{fid}/reply`; an empty
+/// answer cancels the form instead of dead-ending the turn.
+async fn reply_question(
+    http: &reqwest::Client,
+    endpoint: &AgentEndpoint,
+    native_session: &str,
+    prompt: &WirePrompt,
+    answer: &PromptAnswer,
+) -> Result<()> {
+    let request_id = prompt
+        .native_id
+        .as_deref()
+        .ok_or_else(|| anyhow!("opencode prompt has no reply id"))?;
+    if endpoint.version == OpenCodeVersion::V1 {
+        if answer.answers.is_empty() {
+            // No selection: reject the question rather than reply empty, so
+            // opencode surfaces the model's fallback path.
+            serve_post(
+                http,
+                endpoint,
+                format!("{}/question/{request_id}/reject", endpoint.base()),
+                &json!({}),
+            )
+            .await?
+            .error_for_status()?;
+        } else {
+            // opencode takes an array of answers, one per question; we only
+            // surface the first question, so send a single answer array.
+            serve_post(
+                http,
+                endpoint,
+                format!("{}/question/{request_id}/reply", endpoint.base()),
+                &json!({ "answers": [&answer.answers] }),
+            )
+            .await?
+            .error_for_status()?;
+        }
+        return Ok(());
+    }
+    if answer.answers.is_empty() {
+        serve_post(
+            http,
+            endpoint,
+            format!(
+                "{}/api/session/{native_session}/form/{request_id}/cancel",
+                endpoint.base()
+            ),
+            &json!({}),
+        )
+        .await?
+        .error_for_status()?;
+        return Ok(());
+    }
+    // Re-read the live form so option labels resolve against its current
+    // fields, then translate the chosen labels to field values.
+    let state = serve_get(
+        http,
+        endpoint,
+        format!(
+            "{}/api/session/{native_session}/form/{request_id}/state",
+            endpoint.base()
+        ),
+    )
+    .await?
+    .error_for_status()?
+    .json::<Value>()
+    .await?;
+    let form = state.get("data").unwrap_or(&state);
+    let answer_map = v2_form_answer(form, &answer.answers).ok_or_else(|| {
+        anyhow!("could not map the answer onto the pending form — it may have changed")
+    })?;
+    serve_post(
+        http,
+        endpoint,
+        format!(
+            "{}/api/session/{native_session}/form/{request_id}/reply",
+            endpoint.base()
+        ),
+        &json!({ "answer": answer_map }),
+    )
+    .await?
+    .error_for_status()?;
     Ok(())
 }
 
@@ -1029,29 +1232,50 @@ fn opencode_setup_response(response: reqwest::Response) -> Result<reqwest::Respo
 async fn opencode_setup_attempt(
     ctx: &mut TurnCtx,
     store: NativeStore,
-) -> Result<(String, String, reqwest::Response)> {
+) -> Result<(String, AgentEndpoint, Option<reqwest::Response>)> {
     let status = ctx
         .host
         .opencode
         .ensure(&ctx.project, &ctx.session_id, store, ctx.model.as_deref())
         .await?;
-    let port = status
-        .port
+    let endpoint = ctx
+        .host
+        .opencode
+        .endpoint_for(&ctx.session_id)
+        .await
+        .filter(|endpoint| Some(endpoint.port) == status.port)
         .ok_or(OpenCodeSetupProtocolError("opencode agent has no port"))?;
-    let base = format!("http://127.0.0.1:{port}");
+    let base = endpoint.base();
     let native_id = match &ctx.native_session_id {
         Some(id) => id.clone(),
         None => {
-            let response = ctx
-                .http()
-                .post(format!("{base}/session"))
-                .header("content-type", "application/json")
-                .body("{}")
-                .send()
-                .await?;
-            let session: Value = opencode_setup_response(response)?.json().await?;
-            let id = session
-                .get("id")
+            let created = match endpoint.version {
+                OpenCodeVersion::V1 => {
+                    let response = ctx
+                        .http()
+                        .post(format!("{base}/session"))
+                        .header("content-type", "application/json")
+                        .body("{}")
+                        .send()
+                        .await?;
+                    opencode_setup_response(response)?.json::<Value>().await?
+                }
+                // v2 answers `{data: Session.Info}` and takes the agent and
+                // model up front, like v1's per-message fields.
+                OpenCodeVersion::V2 => {
+                    let response = serve_post(
+                        ctx.http(),
+                        &endpoint,
+                        format!("{base}/api/session"),
+                        &v2_session_create(ctx),
+                    )
+                    .await?;
+                    opencode_setup_response(response)?.json::<Value>().await?
+                }
+            };
+            let id = created
+                .pointer("/data/id")
+                .or_else(|| created.get("id"))
                 .and_then(Value::as_str)
                 .ok_or(OpenCodeSetupProtocolError(
                     "opencode session response had no id",
@@ -1061,15 +1285,38 @@ async fn opencode_setup_attempt(
             id
         }
     };
-    let events = ctx.http().get(format!("{base}/event")).send().await?;
-    let events = opencode_setup_response(events)?;
-    Ok((native_id, base, events))
+    // v1 multiplexes every turn over one global SSE stream subscribed here;
+    // v2 turns poll the session endpoints instead (see `run_turn_v2`).
+    let events = match endpoint.version {
+        OpenCodeVersion::V1 => Some(opencode_setup_response(
+            ctx.http().get(format!("{base}/event")).send().await?,
+        )?),
+        OpenCodeVersion::V2 => None,
+    };
+    Ok((native_id, endpoint, events))
+}
+
+/// Session-create body for a v2 serve: the turn's agent and, when the session
+/// selected one, its model (`provider/model` → Model.Ref plus the reasoning
+/// variant). Absent a selection the server default stands.
+fn v2_session_create(ctx: &TurnCtx) -> Value {
+    let mut body = json!({ "agent": opencode_agent(ctx.plan_mode) });
+    if let Some(model) = &ctx.model {
+        if let Some((provider, id)) = model.split_once('/') {
+            let mut reference = json!({ "providerID": provider, "id": id });
+            if let Some(variant) = opencode_variant(ctx.reasoning_level.as_deref()) {
+                reference["variant"] = json!(variant);
+            }
+            body["model"] = reference;
+        }
+    }
+    body
 }
 
 async fn opencode_pre_accept_setup(
     ctx: &mut TurnCtx,
     store: NativeStore,
-) -> Result<(String, String, reqwest::Response)> {
+) -> Result<(String, AgentEndpoint, Option<reqwest::Response>)> {
     loop {
         let remaining = ctx.orx_retry_remaining();
         let attempt = opencode_setup_attempt(ctx, store);
@@ -1125,6 +1372,391 @@ async fn opencode_pre_accept_setup(
     }
 }
 
+/// v2 turn: admit the prompt, then poll the session until its agent loop goes
+/// idle. v2 has no turn-scoped POST and no stable global SSE contract orx can
+/// rely on, so permissions and question forms are drained from their list
+/// endpoints each pass — auto-approved per the session mode, otherwise
+/// surfaced as cards exactly like v1's `permission.asked` / `question.asked`
+/// events — and the transcript merges progressively from the session export.
+async fn run_turn_v2(ctx: &mut TurnCtx, native_id: &str, endpoint: &AgentEndpoint) -> Result<()> {
+    let http = ctx.http().clone();
+    let base = endpoint.base();
+    let admitted = serve_post(
+        &http,
+        endpoint,
+        format!("{base}/api/session/{native_id}/prompt"),
+        &json!({ "text": ctx.text }),
+    )
+    .await?;
+    // Admission confirms the session still exists; a 404 here means the
+    // native session died between setup and now.
+    let _user_message: Value = opencode_setup_response(admitted)?.json().await?;
+    ctx.mark_delivery(DeliveryState::Accepted);
+    ctx.clear_retry_status();
+
+    let turn_started_at = crate::store::now_ms();
+    let mut surfaced: HashSet<String> = HashSet::new();
+    loop {
+        drain_v2_prompts(ctx, native_id, endpoint, &mut surfaced).await?;
+        // Block until the agent loop goes idle. A pending approval or form
+        // answer pauses the loop server-side, so this only resolves once the
+        // turn is truly done — or a surfaced card is answered out of band.
+        let idle = match tokio::time::timeout(
+            Duration::from_secs(30),
+            serve_post(
+                &http,
+                endpoint,
+                format!("{base}/api/session/{native_id}/wait"),
+                &json!({}),
+            ),
+        )
+        .await
+        {
+            Err(_) => false,
+            Ok(Err(error)) => return Err(error),
+            Ok(Ok(response)) => {
+                let status = response.status();
+                if status.is_success() {
+                    true
+                } else if status.as_u16() == 408
+                    || status.as_u16() == 429
+                    || status.is_server_error()
+                {
+                    // Transient: stay in the loop and keep polling.
+                    false
+                } else {
+                    opencode_setup_response(response)?;
+                    unreachable!("opencode_setup_response errors on failure");
+                }
+            }
+        };
+        merge_v2_export(ctx, native_id, endpoint, turn_started_at).await?;
+        if idle && !v2_pending(ctx, native_id, endpoint).await? {
+            break;
+        }
+        if idle {
+            // Idle but something is still pending (e.g. a surfaced card the
+            // user hasn't answered): don't hot-spin the endpoints.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+    finish_v2_turn(ctx, native_id, endpoint, turn_started_at).await
+}
+
+/// Reply to (auto mode) or surface (default mode) every pending v2 permission
+/// and form. Mirrors `handle_prompt_event`'s policy: auto-approve answers
+/// `always` to an approval request; questions always surface — there is no
+/// sensible auto-answer. `surfaced` keeps cards from being emitted twice.
+async fn drain_v2_prompts(
+    ctx: &mut TurnCtx,
+    native_id: &str,
+    endpoint: &AgentEndpoint,
+    surfaced: &mut HashSet<String>,
+) -> Result<()> {
+    let http = ctx.http().clone();
+    let base = endpoint.base();
+    let auto = opencode_auto_approve(ctx.permission_mode);
+    let permissions = serve_get(
+        &http,
+        endpoint,
+        format!("{base}/api/session/{native_id}/permission"),
+    )
+    .await?;
+    for item in data_array(&opencode_setup_response(permissions)?.json().await?) {
+        let Some(id) = item.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if auto {
+            post_permission(&http, endpoint, native_id, id, "always").await?;
+        } else if surfaced.insert(id.to_string()) {
+            let action = item.get("action").and_then(Value::as_str);
+            let detail = item
+                .get("metadata")
+                .filter(|m| !m.is_null())
+                .cloned()
+                .or_else(|| {
+                    let resources = item.get("resources").cloned().unwrap_or(Value::Null);
+                    let message = item.get("message").cloned().unwrap_or(Value::Null);
+                    Some(json!({ "resources": resources, "message": message }))
+                });
+            if let Some(card) = permission_card(&json!({
+                "id": id,
+                "permission": action,
+                "metadata": detail,
+            })) {
+                surface_card(ctx, card);
+            }
+        }
+    }
+    let forms = serve_get(
+        &http,
+        endpoint,
+        format!("{base}/api/session/{native_id}/form"),
+    )
+    .await?;
+    for form in data_array(&opencode_setup_response(forms)?.json().await?) {
+        let Some(id) = form.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if surfaced.insert(id.to_string()) {
+            if let Some(card) = v2_form_card(form) {
+                surface_card(ctx, card);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// True while the session still owns any pending permission or form —
+/// surfaced or not. Consulted after an idle `wait` so a request that lands
+/// between the last drain and the wait's return keeps the loop alive.
+async fn v2_pending(ctx: &TurnCtx, native_id: &str, endpoint: &AgentEndpoint) -> Result<bool> {
+    let http = ctx.http().clone();
+    let base = endpoint.base();
+    for path in ["permission", "form"] {
+        let response = serve_get(
+            &http,
+            endpoint,
+            format!("{base}/api/session/{native_id}/{path}"),
+        )
+        .await?;
+        if !data_array(&opencode_setup_response(response)?.json().await?).is_empty() {
+            return Ok(true);
+        }
+    }
+    let _ = ctx;
+    Ok(false)
+}
+
+/// Merge the v2 session export's assistant messages into the wire transcript,
+/// newest last. Only messages created after the turn started count — a reused
+/// native session carries older turns — with a fallback to the latest
+/// assistant message when clocks disagree.
+async fn merge_v2_export(
+    ctx: &mut TurnCtx,
+    native_id: &str,
+    endpoint: &AgentEndpoint,
+    turn_started_at: i64,
+) -> Result<()> {
+    let _ = native_id;
+    let export = v2_export(ctx, endpoint).await?;
+    let mut current: Vec<&Value> = export
+        .iter()
+        .filter(|m| m.get("type").and_then(Value::as_str) == Some("assistant"))
+        .filter(|m| v2_created_ms(m) >= turn_started_at)
+        .collect();
+    if current.is_empty() {
+        current = export
+            .iter()
+            .filter(|m| m.get("type").and_then(Value::as_str) == Some("assistant"))
+            .collect();
+    }
+    for message in current {
+        for wire in v2_wire_parts(message) {
+            ctx.upsert_part(wire);
+        }
+    }
+    ctx.maybe_flush();
+    Ok(())
+}
+
+/// Finalize a v2 turn from the authoritative export: terminal errors,
+/// context-compaction, usage, and the adopted title.
+async fn finish_v2_turn(
+    ctx: &mut TurnCtx,
+    native_id: &str,
+    endpoint: &AgentEndpoint,
+    turn_started_at: i64,
+) -> Result<()> {
+    let _ = native_id;
+    merge_v2_export(ctx, native_id, endpoint, turn_started_at).await?;
+    let export = v2_export(ctx, endpoint).await?;
+    let mut assistants: Vec<&Value> = export
+        .iter()
+        .filter(|m| m.get("type").and_then(Value::as_str) == Some("assistant"))
+        .collect();
+    if let Some(last) = assistants.pop() {
+        if let Some(error) = v2_message_error(last) {
+            ctx.mark_native_retry_exhausted();
+            ctx.mark_terminal_failure("opencode_terminal", error.clone());
+            return Err(anyhow!("{error}"));
+        }
+        if last.get("finish").and_then(Value::as_str) == Some("error") {
+            let message = "OpenCode reported an error for this turn.";
+            ctx.mark_native_retry_exhausted();
+            ctx.mark_terminal_failure("opencode_terminal", message);
+            return Err(anyhow!("{message}"));
+        }
+        let mut used = 0u64;
+        if let Some(tokens) = last.get("tokens") {
+            let field = |name: &str| v2_u64(tokens.get(name));
+            let cache = tokens.get("cache");
+            used = field("input")
+                + field("output")
+                + field("reasoning")
+                + cache.map(|c| v2_u64(c.get("read"))).unwrap_or(0)
+                + cache.map(|c| v2_u64(c.get("write"))).unwrap_or(0);
+        }
+        if used > 0 {
+            ctx.report_usage(ContextUsage {
+                used_tokens: used,
+                context_window: None,
+            });
+        }
+    }
+    if export.iter().any(|m| {
+        m.get("type").and_then(Value::as_str) == Some("compaction")
+            && v2_created_ms(m) >= turn_started_at
+    }) {
+        let message =
+            "OpenCode compacted the context but did not resume this turn. Continue the chat to resume.";
+        ctx.mark_terminal_failure("opencode_compacted", message);
+        return Err(anyhow!("{message}"));
+    }
+    let _ = turn_started_at;
+    Ok(())
+}
+
+/// The v2 export's message list for this turn's session.
+async fn v2_export(ctx: &TurnCtx, endpoint: &AgentEndpoint) -> Result<Vec<Value>> {
+    let native_id = ctx
+        .native_session_id
+        .as_deref()
+        .ok_or_else(|| anyhow!("opencode session has no native id — cannot read the transcript"))?;
+    let export = serve_get(
+        ctx.http(),
+        endpoint,
+        format!("{}/api/session/{native_id}/export", endpoint.base()),
+    )
+    .await?;
+    let body: Value = opencode_setup_response(export)?.json().await?;
+    Ok(body
+        .pointer("/data/messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// `time.created` as epoch millis, tolerating a seconds-epoch server.
+fn v2_created_ms(message: &Value) -> i64 {
+    let created = message
+        .pointer("/time/created")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0) as i64;
+    if created > 0 && created < 10_000_000_000 {
+        created * 1000
+    } else {
+        created
+    }
+}
+
+fn v2_u64(value: Option<&Value>) -> u64 {
+    value
+        .and_then(Value::as_u64)
+        .or_else(|| value.and_then(Value::as_f64).map(|n| n as u64))
+        .unwrap_or(0)
+}
+
+/// A v2 export assistant message → wire parts. Content items carry no ids, so
+/// part ids are synthesized as `{message_id}:{index}` (stable across polls,
+/// so progressive merges upsert rather than duplicate).
+fn v2_wire_parts(message: &Value) -> Vec<WirePart> {
+    let mid = message.get("id").and_then(Value::as_str).unwrap_or("msg");
+    let content = message
+        .get("content")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    content
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            let fallback = format!("{mid}:{index}");
+            match item.get("type").and_then(Value::as_str) {
+                Some("text") | Some("reasoning") => Some(WirePart {
+                    id: fallback,
+                    kind: item
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("text")
+                        .into(),
+                    text: item.get("text").and_then(Value::as_str).map(str::to_string),
+                    tool: None,
+                    state: None,
+                    prompt: None,
+                    children: Vec::new(),
+                }),
+                Some("tool") => {
+                    let state = item.get("state").unwrap_or(&Value::Null);
+                    let output = state
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .map(|contents| {
+                            contents
+                                .iter()
+                                .filter(|c| c.get("type").and_then(Value::as_str) == Some("text"))
+                                .filter_map(|c| c.get("text").and_then(Value::as_str))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .filter(|text| !text.is_empty());
+                    let error = state
+                        .get("error")
+                        .and_then(|error| {
+                            error
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                                .or_else(|| (!error.is_null()).then(|| error.to_string()))
+                        })
+                        .filter(|error| !error.is_empty() && error != "null");
+                    Some(WirePart {
+                        id: item
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .unwrap_or(fallback),
+                        kind: "tool".into(),
+                        text: None,
+                        tool: item.get("name").and_then(Value::as_str).map(str::to_string),
+                        state: Some(WireToolState {
+                            status: state
+                                .get("status")
+                                .and_then(Value::as_str)
+                                .unwrap_or("running")
+                                .into(),
+                            input: state.get("input").cloned(),
+                            output,
+                            error,
+                            title: None,
+                        }),
+                        prompt: None,
+                        children: Vec::new(),
+                    })
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// A v2 assistant message's terminal error, if it carries one.
+fn v2_message_error(message: &Value) -> Option<String> {
+    let error = message.get("error")?;
+    if error.is_null() {
+        return None;
+    }
+    Some(
+        error
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                serde_json::to_string(error).unwrap_or_else(|_| "OpenCode reported an error".into())
+            }),
+    )
+}
+
 async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     // Native permission and question requests die with their turn. Clear any
     // crash/restart leftovers before a new live request can be surfaced.
@@ -1149,7 +1781,16 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
         ctx.native_session_id = None;
     }
 
-    let (native_id, base, events) = opencode_pre_accept_setup(ctx, store).await?;
+    let (native_id, endpoint, events) = opencode_pre_accept_setup(ctx, store).await?;
+    // v2 serves speak the `/api` REST surface with Basic auth and no
+    // turn-scoped POST/SSE contract — see `run_turn_v2`.
+    if endpoint.version == OpenCodeVersion::V2 {
+        return run_turn_v2(ctx, &native_id, &endpoint).await;
+    }
+    let Some(events) = events else {
+        return Err(OpenCodeSetupProtocolError("opencode agent gave no event stream").into());
+    };
+    let base = endpoint.base();
     let mut stream = events.bytes_stream();
 
     let mut body = json!({
@@ -1224,7 +1865,7 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
                     if !handle_prompt_event(
                         ctx,
                         &native_id,
-                        &base,
+                        &endpoint,
                         &event,
                         &plan_exit_calls,
                     )
@@ -1488,6 +2129,178 @@ fn handle_event(
     }
 }
 
+/// v2 pending form → a `question` card. `native_id` carries the form id
+/// (`frm_*`) so `reply_question` can answer it. Option labels come from
+/// option-style fields (multiselect / string-with-options) plus synthesized
+/// yes/no options for boolean fields; the label→(field, value) mapping is
+/// rebuilt from live form state at reply time, so the card only needs labels.
+fn v2_form_card(form: &Value) -> Option<WirePrompt> {
+    let id = form.get("id").and_then(Value::as_str)?.to_string();
+    let (options, _, multi) = v2_form_options(form);
+    let fields: Vec<Value> = form
+        .get("fields")
+        .and_then(Value::as_array)
+        .map(|fields| {
+            fields
+                .iter()
+                .map(|field| {
+                    json!({
+                        "title": field.get("title"),
+                        "description": field.get("description"),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(WirePrompt {
+        kind: "question".into(),
+        question: form
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        header: None,
+        options,
+        multi_select: multi,
+        plan_exit: false,
+        tool_input: Some(json!({ "fields": fields })),
+        native_id: Some(id),
+        ..Default::default()
+    })
+}
+
+/// Shared option/mapping builder for v2 forms: option labels for the card
+/// plus the label→(field key, value) map the reply needs. Boolean labels are
+/// prefixed with the field title when several boolean fields compete over
+/// plain "Yes"/"No".
+fn v2_form_options(
+    form: &Value,
+) -> (
+    Vec<WireQuestionOption>,
+    std::collections::HashMap<String, (String, Value)>,
+    bool,
+) {
+    let mut options = Vec::new();
+    let mut mapping = std::collections::HashMap::new();
+    let mut multi = false;
+    let fields = form
+        .get("fields")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let booleans = fields
+        .iter()
+        .filter(|f| f.get("type").and_then(Value::as_str) == Some("boolean"))
+        .count();
+    // A lone boolean reads fine as plain Yes/No; alongside other fields the
+    // labels carry the field title so answers stay attributable.
+    for field in &fields {
+        let key = field.get("key").and_then(Value::as_str).unwrap_or("");
+        if key.is_empty() {
+            continue;
+        }
+        match field.get("type").and_then(Value::as_str) {
+            Some("multiselect") => {
+                multi = true;
+                if let Some(list) = field.get("options").and_then(Value::as_array) {
+                    for opt in list {
+                        let (Some(label), Some(value)) = (
+                            opt.get("label").and_then(Value::as_str),
+                            opt.get("value").and_then(Value::as_str),
+                        ) else {
+                            continue;
+                        };
+                        options.push(WireQuestionOption {
+                            label: label.to_string(),
+                            description: opt
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        });
+                        mapping.insert(
+                            label.to_string(),
+                            (key.to_string(), Value::String(value.to_string())),
+                        );
+                    }
+                }
+            }
+            Some("string") => {
+                if let Some(list) = field.get("options").and_then(Value::as_array) {
+                    for opt in list {
+                        let (Some(label), Some(value)) = (
+                            opt.get("label").and_then(Value::as_str),
+                            opt.get("value").and_then(Value::as_str),
+                        ) else {
+                            continue;
+                        };
+                        options.push(WireQuestionOption {
+                            label: label.to_string(),
+                            description: opt
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        });
+                        mapping.insert(
+                            label.to_string(),
+                            (key.to_string(), Value::String(value.to_string())),
+                        );
+                    }
+                }
+            }
+            Some("boolean") => {
+                let title = field.get("title").and_then(Value::as_str).unwrap_or(key);
+                let (yes, no) = if booleans == 1 && fields.len() == 1 {
+                    ("Yes".to_string(), "No".to_string())
+                } else {
+                    (format!("{title}: Yes"), format!("{title}: No"))
+                };
+                options.push(WireQuestionOption {
+                    label: yes.clone(),
+                    description: None,
+                });
+                options.push(WireQuestionOption {
+                    label: no.clone(),
+                    description: None,
+                });
+                mapping.insert(yes, (key.to_string(), Value::Bool(true)));
+                mapping.insert(no, (key.to_string(), Value::Bool(false)));
+            }
+            _ => {}
+        }
+    }
+    (options, mapping, multi)
+}
+
+/// Map chosen option labels back to a v2 `Form.Answer` (`{field_key: value}`,
+/// arrays for multiselect fields). `None` when a label no longer resolves —
+/// the form changed under the card.
+fn v2_form_answer(form: &Value, answers: &[String]) -> Option<Value> {
+    let (_, mapping, _) = v2_form_options(form);
+    let fields: Vec<Value> = form
+        .get("fields")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let is_multi = |key: &str| {
+        fields.iter().any(|field| {
+            field.get("key").and_then(Value::as_str) == Some(key)
+                && field.get("type").and_then(Value::as_str) == Some("multiselect")
+        })
+    };
+    let mut out = serde_json::Map::new();
+    for label in answers {
+        let (key, value) = mapping.get(label)?;
+        if is_multi(key) {
+            out.entry(key.clone())
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()?
+                .push(value.clone());
+        } else {
+            out.insert(key.clone(), value.clone());
+        }
+    }
+    Some(Value::Object(out))
+}
+
 /// Surface a prompt card and flush it so it renders immediately (before the
 /// turn resumes). The card's `native_id` (the reply target) is also its
 /// `WirePart` id, so the user's answer round-trips back to the right request.
@@ -1514,7 +2327,7 @@ fn surface_card(ctx: &mut TurnCtx, card: WirePrompt) {
 async fn handle_prompt_event(
     ctx: &mut TurnCtx,
     native_id: &str,
-    base: &str,
+    endpoint: &AgentEndpoint,
     event: &Value,
     plan_exit_calls: &HashSet<String>,
 ) -> Result<bool> {
@@ -1542,7 +2355,7 @@ async fn handle_prompt_event(
                     // the reply POST fails, don't kill the turn: fall back to a
                     // card so the user can decide.
                     if let Err(err) =
-                        post_permission(ctx.http(), base, native_id, id, "always").await
+                        post_permission(ctx.http(), endpoint, native_id, id, "always").await
                     {
                         eprintln!("orx up: opencode auto-approve failed, surfacing card: {err}");
                         surface_card(ctx, card);
@@ -1755,10 +2568,15 @@ opencode/glm-5
 
     /// Garbage or a `--verbose` flag the installed CLI doesn't support yields
     /// no models, which sends `opencode_models` to the plain-list fallback.
+    /// (opencode2 has no `--verbose`: its help text is exactly such output.)
     #[test]
     fn unparseable_verbose_output_yields_nothing() {
         assert!(parse_verbose_models("").is_empty());
         assert!(parse_verbose_models("error: unknown flag --verbose").is_empty());
+        assert!(parse_verbose_models(
+            "DESCRIPTION\n  List all available models\n\nUSAGE\n  opencode2 models [flags]\n"
+        )
+        .is_empty());
         // Header with no JSON block is skipped, not half-parsed.
         assert!(parse_verbose_models("opencode/foo\nnot json\n").is_empty());
     }
@@ -1850,6 +2668,138 @@ opencode/glm-5
             assert_eq!(opencode_agent(plan_mode), agent);
             assert_eq!(opencode_auto_approve(permission_mode), auto_approve);
         }
+    }
+
+    /// v2 `debug config` answers an array of `{type, path, info}` sources;
+    /// the default model and custom providers fold out of the `info` objects
+    /// while a v1 object passes through untouched.
+    #[test]
+    fn debug_config_array_folds_to_v1_shape() {
+        let v1 = json!({"model": "a/b", "provider": {"a": {}}});
+        assert_eq!(normalize_debug_config(&v1), v1);
+        let v2 = json!([
+            {"type": "global", "path": "p1", "info": {
+                "model": {"providerID": "freebuff", "model": "glm-5-3-flash"},
+                "providers": {"freebuff": {"options": {"baseURL": "http://127.0.0.1:8080/v1"}}},
+            }},
+            {"type": "claude", "path": "p2"},
+            {"type": "project", "path": "p3", "info": {"model": "x/y"}},
+        ]);
+        let folded = normalize_debug_config(&v2);
+        assert_eq!(
+            folded.get("model").and_then(Value::as_str),
+            Some("freebuff/glm-5-3-flash")
+        );
+        assert!(folded
+            .pointer("/provider/freebuff/options/baseURL")
+            .is_some());
+        // First source with a model wins.
+        assert_ne!(folded.get("model").and_then(Value::as_str), Some("x/y"));
+        assert!(normalize_debug_config(&json!([])).as_object().is_some());
+    }
+
+    /// opencode2-first binary classification is by file stem.
+    #[test]
+    fn version_follows_the_binary_stem() {
+        use crate::local::opencode::{opencode_version_of, OpenCodeVersion};
+        use std::path::Path;
+        assert_eq!(
+            opencode_version_of(Path::new(r"C:\npm\opencode2.cmd")),
+            OpenCodeVersion::V2
+        );
+        assert_eq!(
+            opencode_version_of(Path::new("/usr/bin/opencode2")),
+            OpenCodeVersion::V2
+        );
+        assert_eq!(
+            opencode_version_of(Path::new(r"C:\npm\opencode.cmd")),
+            OpenCodeVersion::V1
+        );
+        assert_eq!(
+            opencode_version_of(Path::new("/usr/bin/opencode")),
+            OpenCodeVersion::V1
+        );
+    }
+
+    /// v2 form → question card → answer map round-trips: every surfaced label
+    /// resolves back to its field value, multiselects group into arrays, and a
+    /// stale label fails instead of mis-answering.
+    #[test]
+    fn v2_form_cards_round_trip_answers() {
+        let form = json!({
+            "id": "frm_1",
+            "sessionID": "ses_1",
+            "title": "Which model?",
+            "fields": [
+                {"key": "model", "type": "multiselect", "title": "Model",
+                 "options": [
+                     {"value": "a", "label": "Alpha", "description": "first"},
+                     {"value": "b", "label": "Beta"},
+                 ]},
+                {"key": "confirm", "type": "boolean", "title": "Sure?"},
+            ],
+        });
+        let card = v2_form_card(&form).expect("card");
+        assert_eq!(card.kind, "question");
+        assert_eq!(card.native_id.as_deref(), Some("frm_1"));
+        assert!(card.multi_select);
+        let labels: Vec<_> = card.options.iter().map(|o| o.label.as_str()).collect();
+        assert!(labels.contains(&"Alpha"));
+        assert!(labels.contains(&"Sure?: Yes"));
+        let answer = v2_form_answer(&form, &["Alpha".to_string(), "Sure?: Yes".to_string()])
+            .expect("answer");
+        assert_eq!(answer.pointer("/model"), Some(&json!(["a"])));
+        assert_eq!(answer.pointer("/confirm"), Some(&json!(true)));
+        assert!(v2_form_answer(&form, &["Stale".to_string()]).is_none());
+        // Single boolean keeps plain Yes/No labels.
+        let solo = json!({
+            "id": "frm_2", "sessionID": "ses_1", "title": "Go?",
+            "fields": [{"key": "go", "type": "boolean", "title": "Go"}],
+        });
+        let card = v2_form_card(&solo).expect("card");
+        assert!(card.options.iter().any(|o| o.label == "Yes"));
+        assert_eq!(
+            v2_form_answer(&solo, &["No".to_string()]).and_then(|a| a.pointer("/go").cloned()),
+            Some(json!(false))
+        );
+    }
+
+    /// v2 export messages map to wire parts with stable synthesized ids, and
+    /// terminal errors surface.
+    #[test]
+    fn v2_export_parts_map_with_stable_ids() {
+        let message = json!({
+            "id": "msg_1",
+            "time": {"created": 1000},
+            "type": "assistant",
+            "content": [
+                {"type": "text", "text": "hello"},
+                {"type": "tool", "id": "too_1", "name": "read",
+                 "state": {"status": "completed", "input": {"path": "a"},
+                           "content": [{"type": "text", "text": "out"}]}},
+            ],
+        });
+        let parts = v2_wire_parts(&message);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].id, "msg_1:0");
+        assert_eq!(parts[0].text.as_deref(), Some("hello"));
+        assert_eq!(parts[1].id, "too_1");
+        assert_eq!(parts[1].tool.as_deref(), Some("read"));
+        let state = parts[1].state.as_ref().expect("state");
+        assert_eq!(state.status, "completed");
+        assert_eq!(state.output.as_deref(), Some("out"));
+        assert!(v2_message_error(&message).is_none());
+        assert!(v2_message_error(&json!({"error": {"message": "boom"}})).is_some());
+        assert!(v2_message_error(&json!({"error": null})).is_none());
+        // Millis-epoch passes through; seconds-epoch normalizes to millis.
+        assert_eq!(
+            v2_created_ms(&json!({"time": {"created": 1787000000000.0}})),
+            1787000000000
+        );
+        assert_eq!(
+            v2_created_ms(&json!({"time": {"created": 1787000000.0}})),
+            1787000000000
+        );
     }
 
     // `properties` payloads shaped exactly like the live `permission.asked` /

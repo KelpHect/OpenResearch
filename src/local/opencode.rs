@@ -30,30 +30,79 @@ const PLAYBOOK_REL: &str = ".openresearch/agent/autoresearch-local.md";
 
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// `opencode` on PATH, else the installer's default drop location.
-pub fn find_opencode() -> Result<PathBuf> {
-    if let Some(found) = crate::local::shell_env::find_on_path("opencode") {
-        return Ok(found);
+/// Which OpenCode generation a resolved binary belongs to. v2 (`opencode2`,
+/// currently in beta) moved the serve API under `/api`, requires HTTP Basic
+/// auth on it, and dropped several v1 CLI flags — callers must branch.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OpenCodeVersion {
+    V1,
+    V2,
+}
+
+/// A resolved OpenCode binary plus its generation.
+#[derive(Clone, Debug)]
+pub struct OpenCodeBin {
+    pub path: PathBuf,
+    pub version: OpenCodeVersion,
+}
+
+impl OpenCodeBin {
+    pub fn is_v2(&self) -> bool {
+        self.version == OpenCodeVersion::V2
+    }
+}
+
+/// Classify a resolved binary by its file stem: `opencode2*` is v2.
+pub fn opencode_version_of(path: &Path) -> OpenCodeVersion {
+    if path
+        .file_stem()
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("opencode2"))
+    {
+        OpenCodeVersion::V2
+    } else {
+        OpenCodeVersion::V1
+    }
+}
+
+fn candidate_bins(name: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(found) = crate::local::shell_env::find_on_path(name) {
+        out.push(found);
     }
     if let Some(home) = dirs::home_dir() {
         #[cfg(windows)]
-        let candidates = [
-            home.join(".opencode/bin/opencode.exe"),
-            home.join(".opencode/bin/opencode.cmd"),
-        ];
+        let files = [format!("{name}.exe"), format!("{name}.cmd")];
         #[cfg(not(windows))]
-        let candidates = [home.join(".opencode/bin/opencode")];
-        if let Some(found) = candidates.into_iter().find(|candidate| candidate.is_file()) {
-            return Ok(found);
+        let files = [name.to_string()];
+        for file in files {
+            let candidate = home.join(".opencode/bin").join(file);
+            if candidate.is_file() && !out.contains(&candidate) {
+                out.push(candidate);
+            }
         }
     }
-    #[cfg(windows)]
-    let install = "Install it with: irm https://opencode.ai/install | iex";
-    #[cfg(not(windows))]
-    let install = "Install it with: curl -fsSL https://opencode.ai/install | bash";
+    out
+}
+
+/// `opencode2` on PATH (preferred), else v1 `opencode`, else the installer's
+/// default drop location for either.
+pub fn find_opencode_bin() -> Result<OpenCodeBin> {
+    for name in ["opencode2", "opencode"] {
+        if let Some(path) = candidate_bins(name).into_iter().next() {
+            return Ok(OpenCodeBin {
+                version: opencode_version_of(&path),
+                path,
+            });
+        }
+    }
     Err(anyhow!(
-        "opencode not found (checked PATH and ~/.opencode/bin/opencode).\n{install}"
+        "opencode2/opencode not found (checked PATH and ~/.opencode/bin/).\nInstall it with: npm i -g @opencode/cli"
     ))
+}
+
+/// `opencode` on PATH, else the installer's default drop location.
+pub fn find_opencode() -> Result<PathBuf> {
+    find_opencode_bin().map(|bin| bin.path)
 }
 
 /// Ask the OS for a free loopback port (bind :0, read it back, release).
@@ -385,6 +434,10 @@ struct AgentChild {
     session_id: String,
     model: Option<String>,
     native_store: NativeStore,
+    version: OpenCodeVersion,
+    /// v2 `serve` prints a per-instance `server password` and guards the API
+    /// with HTTP Basic auth (`opencode` user). v1 serves have none.
+    password: Option<String>,
 }
 
 impl AgentChild {
@@ -397,14 +450,53 @@ impl AgentChild {
             model: self.model.clone(),
         }
     }
+
+    fn endpoint(&self) -> AgentEndpoint {
+        AgentEndpoint {
+            port: self.port,
+            version: self.version,
+            password: self.password.clone(),
+        }
+    }
+}
+
+/// How to reach one session's live serve child.
+#[derive(Clone, Debug)]
+pub struct AgentEndpoint {
+    pub port: u16,
+    pub version: OpenCodeVersion,
+    pub password: Option<String>,
+}
+
+impl AgentEndpoint {
+    pub fn base(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// v2 serves require HTTP Basic auth (`opencode` user, per-instance
+    /// password); v1 serves take none.
+    pub fn auth(&self) -> Option<(String, String)> {
+        self.password
+            .as_deref()
+            .map(|password| ("opencode".to_string(), password.to_string()))
+    }
 }
 
 /// Poll `/global/health` until opencode answers, watching for early exit.
-async fn wait_healthy(child: &mut Child, port: u16) -> Result<()> {
+async fn wait_healthy(
+    child: &mut Child,
+    port: u16,
+    version: OpenCodeVersion,
+    password: Option<&str>,
+) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()?;
-    let url = format!("http://127.0.0.1:{port}/global/health");
+    let path = match version {
+        OpenCodeVersion::V1 => "/global/health",
+        OpenCodeVersion::V2 => "/api/health",
+    };
+    let url = format!("http://127.0.0.1:{port}{path}");
     let deadline = Instant::now() + HEALTH_TIMEOUT;
     loop {
         if let Some(status) = child.try_wait()? {
@@ -413,19 +505,60 @@ async fn wait_healthy(child: &mut Child, port: u16) -> Result<()> {
                 agent_log_path().display()
             ));
         }
-        if let Ok(resp) = client.get(&url).send().await {
+        let mut request = client.get(&url);
+        if version == OpenCodeVersion::V2 {
+            if let Some(password) = password {
+                request = request.basic_auth("opencode", Some(password));
+            }
+        }
+        if let Ok(resp) = request.send().await {
             if resp.status().is_success() {
                 return Ok(());
             }
         }
         if Instant::now() >= deadline {
             return Err(anyhow!(
-                "opencode did not become healthy on 127.0.0.1:{port} within {}s; see {}",
+                "opencode did not become healthy on 127.0.0.1:{port}{path} within {}s; see {}",
                 HEALTH_TIMEOUT.as_secs(),
                 agent_log_path().display()
             ));
         }
         tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+}
+
+/// A v2 `serve` prints `server password <secret>` on stdout once it listens;
+/// that password is the HTTP Basic credential for the instance. Scan only the
+/// bytes appended after `since_len` so an older run's password never leaks in.
+async fn read_server_password(child: &mut Child, since_len: u64) -> Result<String> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Err(anyhow!(
+                "opencode exited during startup ({status}); see {}",
+                agent_log_path().display()
+            ));
+        }
+        if let Ok(text) = std::fs::read_to_string(agent_log_path()) {
+            if let Some(line) = text
+                .get(since_len as usize..)
+                .unwrap_or("")
+                .lines()
+                .find_map(|line| line.strip_prefix("server password "))
+            {
+                let password = line.trim().to_string();
+                if !password.is_empty() {
+                    return Ok(password);
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "opencode did not print its server password; see {}",
+                agent_log_path().display()
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -438,7 +571,7 @@ async fn spawn_agent(
     up_port: Option<u16>,
     native_store: NativeStore,
 ) -> Result<AgentChild> {
-    let bin = find_opencode()?;
+    let bin = find_opencode_bin()?;
     // The clone/worktree setup inside can hit the network; keep it off the
     // async workers.
     let (repo, config_override) = {
@@ -459,22 +592,36 @@ async fn spawn_agent(
         std::fs::create_dir_all(parent)
             .map_err(|e| anyhow!("Could not create {}: {}", parent.display(), e))?;
     }
+    let log_len = std::fs::metadata(agent_log_path())
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(agent_log_path())
         .map_err(|e| anyhow!("Could not open {}: {}", agent_log_path().display(), e))?;
 
-    let mut cmd = crate::sys::tokio_command(&bin);
-    cmd.arg("serve")
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--hostname")
-        .arg("127.0.0.1")
-        // Without --print-logs the log file stays empty and startup failures
-        // are undiagnosable.
-        .arg("--print-logs")
-        .current_dir(&repo)
+    let mut cmd = crate::sys::tokio_command(&bin.path);
+    // v2's flag parser only accepts the `--flag=value` spelling.
+    match bin.version {
+        OpenCodeVersion::V1 => {
+            cmd.arg("serve")
+                .arg("--port")
+                .arg(port.to_string())
+                .arg("--hostname")
+                .arg("127.0.0.1")
+                // Without --print-logs the log file stays empty and startup failures
+                // are undiagnosable.
+                .arg("--print-logs");
+        }
+        OpenCodeVersion::V2 => {
+            cmd.arg("serve")
+                .arg(format!("--port={port}"))
+                .arg("--hostname=127.0.0.1")
+                .arg("--print-logs");
+        }
+    }
+    cmd.current_dir(&repo)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone().map_err(|e| anyhow!("{e}"))?))
         .stderr(Stdio::from(log))
@@ -501,8 +648,18 @@ async fn spawn_agent(
 
     let mut child = cmd
         .spawn()
-        .map_err(|e| anyhow!("Could not spawn {}: {}", bin.display(), e))?;
-    if let Err(err) = wait_healthy(&mut child, port).await {
+        .map_err(|e| anyhow!("Could not spawn {}: {}", bin.path.display(), e))?;
+    let password = match bin.version {
+        OpenCodeVersion::V1 => None,
+        OpenCodeVersion::V2 => match read_server_password(&mut child, log_len).await {
+            Ok(password) => Some(password),
+            Err(err) => {
+                let _ = child.kill().await;
+                return Err(err);
+            }
+        },
+    };
+    if let Err(err) = wait_healthy(&mut child, port, bin.version, password.as_deref()).await {
         let _ = child.kill().await;
         return Err(err);
     }
@@ -513,6 +670,8 @@ async fn spawn_agent(
         session_id: session_id.to_string(),
         model: model.map(str::to_string),
         native_store,
+        version: bin.version,
+        password,
     })
 }
 
@@ -554,10 +713,17 @@ impl AgentHost {
 
     /// Loopback port of the session's live server (for inline replies/aborts).
     pub async fn port_for(&self, session_id: &str) -> Option<u16> {
+        self.endpoint_for(session_id).await.map(|e| e.port)
+    }
+
+    /// Full coordinates of the session's live server: port plus the
+    /// credentials a v2 serve requires. Reaps children that died behind our
+    /// back, like [`AgentHost::port_for`].
+    pub async fn endpoint_for(&self, session_id: &str) -> Option<AgentEndpoint> {
         let mut guard = self.inner.lock().await;
         let agent = guard.get_mut(session_id)?;
         if matches!(agent.child.try_wait(), Ok(None)) {
-            Some(agent.port)
+            Some(agent.endpoint())
         } else {
             guard.remove(session_id);
             None

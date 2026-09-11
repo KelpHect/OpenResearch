@@ -5347,12 +5347,23 @@ impl ChatHost {
                 if let Ok(store) = Store::open() {
                     if let Ok(Some(session)) = store.get_chat_session(&session_id) {
                         if session.harness == "opencode" {
-                            if let (Some(nid), Some(port)) = (
+                            if let (Some(nid), Some(endpoint)) = (
                                 &session.native_session_id,
-                                host.opencode.port_for(&session_id).await,
+                                host.opencode.endpoint_for(&session_id).await,
                             ) {
-                                let url = format!("http://127.0.0.1:{port}/session/{nid}/abort");
-                                let _ = host.http.post(url).body("{}").send().await;
+                                let url = match endpoint.version {
+                                    crate::local::opencode::OpenCodeVersion::V1 => {
+                                        format!("{}/session/{nid}/abort", endpoint.base())
+                                    }
+                                    crate::local::opencode::OpenCodeVersion::V2 => {
+                                        format!("{}/api/session/{nid}/interrupt", endpoint.base())
+                                    }
+                                };
+                                let mut request = host.http.post(url).body("{}");
+                                if let Some((user, password)) = endpoint.auth() {
+                                    request = request.basic_auth(user, Some(password));
+                                }
+                                let _ = request.send().await;
                             }
                         } else if session.harness == "codex" {
                             return host.codex.interrupt_session(&session_id).await;
