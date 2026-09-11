@@ -2703,8 +2703,10 @@ opencode/glm-5
     fn version_follows_the_binary_stem() {
         use crate::local::opencode::{opencode_version_of, OpenCodeVersion};
         use std::path::Path;
+        // Forward slashes parse on every platform; backslashes would not
+        // split directories on Unix.
         assert_eq!(
-            opencode_version_of(Path::new(r"C:\npm\opencode2.cmd")),
+            opencode_version_of(Path::new("C:/npm/opencode2.cmd")),
             OpenCodeVersion::V2
         );
         assert_eq!(
@@ -2712,7 +2714,7 @@ opencode/glm-5
             OpenCodeVersion::V2
         );
         assert_eq!(
-            opencode_version_of(Path::new(r"C:\npm\opencode.cmd")),
+            opencode_version_of(Path::new("C:/npm/opencode.cmd")),
             OpenCodeVersion::V1
         );
         assert_eq!(
